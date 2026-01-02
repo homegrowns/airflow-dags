@@ -14,7 +14,7 @@ default_args = {
 
 # 2. DAG 정의
 with DAG(
-    dag_id="hello_world_eks",  # UI에 표시될 이름
+    dag_id="tast_dag_eks",  # UI에 표시될 이름
     default_args=default_args,
     description="EKS S3 Sync Test DAG",
     schedule=timedelta(days=1),  # 매일 실행
@@ -25,13 +25,13 @@ with DAG(
     # Task 1: Bash 명령어로 인사하기
     t1 = BashOperator(
         task_id="print_hello_bash",
-        bash_command='echo "Hello World from Bash! (Running on EKS Worker)"',
+        bash_command='echo "Hello World from Bash!"',
     )
 
     # Task 2: Python 함수로 인사하기
     def print_hello_python():
-        print("Hello World from Python! S3 Sync is working perfectly.")
-        return "Hello World from Python! S3 Sync is working perfectly."
+        print("Hello World from Python! git Sync is working perfectly.")
+        return "Hello World from Python! git Sync is working perfectly."
 
     t2 = PythonOperator(
         task_id="print_hello_python",
