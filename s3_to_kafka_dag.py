@@ -14,6 +14,7 @@ from confluent_kafka import Producer
 
 
 def s3_to_kafka():
+    total_rows = 0
     bootstrap = "kafka-broker-headless.kafka.svc.cluster.local:9092"
     # 또는 더 짧게
     # bootstrap = "kafka-broker-headless.kafka:9092"
@@ -30,6 +31,7 @@ def s3_to_kafka():
             data = s3.get_object(Bucket=bucket, Key=obj["Key"])["Body"].read()
             df = pd.read_parquet(BytesIO(data))
             df = df.where(pd.notnull(df), None)
+            total_rows += len(df)
 
         for record in df.to_dict("records"):
             producer.produce(
@@ -40,6 +42,7 @@ def s3_to_kafka():
             producer.poll(0)
 
     producer.flush()
+    print("총 레코드 수:", total_rows)
 
 
 with DAG(
