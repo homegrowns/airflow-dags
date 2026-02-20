@@ -1,4 +1,5 @@
 import json
+import math
 from datetime import datetime
 from io import BytesIO
 
@@ -21,6 +22,13 @@ def to_json_safe(record: dict) -> str:
     return json.dumps(record, allow_nan=False)
 
 
+def delivery_report(err, msg):
+    if err:
+        print("Delivery failed:", err)
+    else:
+        print("Delivered to", msg.topic(), msg.partition(), msg.offset())
+
+
 def s3_to_kafka():
     total_rows = 0
     bootstrap = "kafka-broker-headless.kafka.svc.cluster.local:9092"
@@ -38,8 +46,14 @@ def s3_to_kafka():
         key = obj["Key"]
         if not key.endswith(".parquet"):
             continue
-        data = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
-        df = pd.read_parquet(BytesIO(data))
+
+        try:
+            data = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+            df = pd.read_parquet(BytesIO(data))
+
+        except Exception as e:
+            print(f"[ERROR] 파일 처리 실패: {key}, {e}")
+            continue
 
         total_rows += len(df)
 
@@ -48,6 +62,7 @@ def s3_to_kafka():
                 topic="zeek-http",
                 key=record.get("community_id"),
                 value=to_json_safe(record),
+                on_delivery=delivery_report,
             )
             producer.poll(0)
 
