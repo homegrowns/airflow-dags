@@ -29,6 +29,7 @@ def s3_to_kafka():
         if obj["Key"].endswith(".parquet"):
             data = s3.get_object(Bucket=bucket, Key=obj["Key"])["Body"].read()
             df = pd.read_parquet(BytesIO(data))
+            df = df.where(pd.notnull(df), None)
 
         for record in df.to_dict("records"):
             producer.produce(
