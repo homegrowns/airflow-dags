@@ -14,8 +14,12 @@ from confluent_kafka import Producer
 
 
 def s3_to_kafka():
-    producer = Producer({"bootstrap.servers": "kafka-broker-headless:9092"})
-    s3 = boto3.client("s3")
+    bootstrap = "kafka-broker-headless.kafka.svc.cluster.local:9092"
+    # 또는 더 짧게
+    # bootstrap = "kafka-broker-headless.kafka:9092"
+
+    producer = Producer({"bootstrap.servers": bootstrap})
+        s3 = boto3.client("s3")
     bucket = "malware-project-bucket"
     prefix = "honeypot/raw/zeek/http/2026-02-11/"
 
