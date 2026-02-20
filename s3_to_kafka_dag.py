@@ -13,7 +13,7 @@ from confluent_kafka import Producer
 # 바이트를 파일처럼 흉내내는 객체
 
 
-def main():
+def s3_to_kafka():
     producer = Producer({"bootstrap.servers": "kafka-broker-headless:9092"})
     s3 = boto3.client("s3")
     bucket = "malware-project-bucket"
@@ -39,7 +39,7 @@ def main():
 
 with DAG(
     dag_id="s3_to_kafka_http",
-    start_date=datetime(2026, 1, 1),
+    start_date=datetime(2026, 2, 20),
     schedule="@hourly",
     catchup=False,
 ) as dag:
