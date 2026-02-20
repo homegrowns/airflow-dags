@@ -19,7 +19,7 @@ def s3_to_kafka():
     # bootstrap = "kafka-broker-headless.kafka:9092"
 
     producer = Producer({"bootstrap.servers": bootstrap})
-        s3 = boto3.client("s3")
+    s3 = boto3.client("s3")
     bucket = "malware-project-bucket"
     prefix = "honeypot/raw/zeek/http/2026-02-11/"
 
