@@ -25,8 +25,7 @@ def to_json_safe(record: dict) -> str:
 def delivery_report(err, msg):
     if err:
         print("Delivery failed:", err)
-    else:
-        print("Delivered to", msg.topic(), msg.partition(), msg.offset())
+        print("try to deliver to", msg.topic(), msg.partition(), msg.offset())
 
 
 def s3_to_kafka():
@@ -38,7 +37,7 @@ def s3_to_kafka():
     producer = Producer({"bootstrap.servers": bootstrap})
     s3 = boto3.client("s3")
     bucket = "malware-project-bucket"
-    prefix = "honeypot/raw/zeek/conn/2026-02-12/"
+    prefix = "honeypot/raw/zeek/conn/2026-02-18/"
 
     response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
 
