@@ -59,7 +59,7 @@ def s3_to_kafka():
 
         for record in df.to_dict("records"):
             producer.produce(
-                topic="zeek-http",
+                topic="zeek-conn",
                 key=record.get("community_id"),
                 value=to_json_safe(record),
                 on_delivery=delivery_report,
