@@ -37,7 +37,7 @@ def s3_to_kafka():
     producer = Producer({"bootstrap.servers": bootstrap})
     s3 = boto3.client("s3")
     bucket = "malware-project-bucket"
-    prefix = "honeypot/raw/zeek/conn/2026-02-18/"
+    prefix = "honeypot/raw/zeek/conn/2026-02-23/"
 
     response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
 
