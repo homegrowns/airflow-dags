@@ -71,7 +71,7 @@ def s3_to_kafka():
 
 
 with DAG(
-    dag_id="s3_to_kafka_http",
+    dag_id="http_s3_to_kafka",
     start_date=datetime(2026, 2, 20),
     schedule="0 12 * * *",
     catchup=False,
