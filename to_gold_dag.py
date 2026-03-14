@@ -88,9 +88,8 @@ def fetch_from_s3(**ctx) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     etag_path = DATA_DIR / ".last_etag"
 
-    # boto3 직접 사용 대신 S3Hook 사용 (aws_default Connection 자동 참조)
-    hook = S3Hook(aws_conn_id="aws_default")
-    s3 = hook.get_conn()
+    # ← region_name 제거, 인자 없이 사용 (성공한 DAG와 동일 방식)
+    s3 = boto3.client("s3")
 
     # S3 오브젝트 메타데이터로 ETag 확인
     head = s3.head_object(Bucket=S3_BUCKET, Key=S3_KEY)
