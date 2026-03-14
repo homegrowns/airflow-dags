@@ -91,6 +91,14 @@ def fetch_from_s3(**ctx) -> None:
     # ← region_name 제거, 인자 없이 사용 (성공한 DAG와 동일 방식)
     s3 = boto3.client("s3")
 
+    # ── 임시 진단: 버킷 루트 목록 확인 ──
+    try:
+        resp = s3.list_objects_v2(Bucket=S3_BUCKET, MaxKeys=10)
+        for obj in resp.get("Contents", []):
+            logger.info("버킷 내 파일: %s", obj["Key"])
+    except Exception as e:
+        logger.error("list_objects 실패: %s", e)
+
     # S3 오브젝트 메타데이터로 ETag 확인
     head = s3.head_object(Bucket=S3_BUCKET, Key=S3_KEY)
     s3_etag = head["ETag"].strip('"')
