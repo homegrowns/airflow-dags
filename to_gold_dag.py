@@ -693,7 +693,7 @@ with DAG(
     description="S3 parquet → session/entity/relation gold 전처리 (5분 주기)",
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
-    schedule_interval="*/5 * * * *",    # 5분마다 실행
+    schedule="*/5 * * * *",    # 5분마다 실행
     catchup=False,
     max_active_runs=1,                   # 동시 실행 1개 제한 (중복 방지)
     tags=["cti", "graph-rag", "preprocessing"],
