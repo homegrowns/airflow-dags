@@ -53,6 +53,8 @@ import boto3
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+
 # ── S3 설정 (환경에 맞게 수정) ───────────────────────────────────────────────
 S3_BUCKET        = "malware-project-bucket"                        # S3 버킷명
 S3_KEY           = "unified_events.parquet"     # S3 오브젝트 경로
@@ -86,7 +88,9 @@ def fetch_from_s3(**ctx) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     etag_path = DATA_DIR / ".last_etag"
 
-    s3 = boto3.client("s3", region_name=AWS_REGION) # .env에 있는 자격증명 자동 사용
+    # boto3 직접 사용 대신 S3Hook 사용 (aws_default Connection 자동 참조)
+    hook = S3Hook(aws_conn_id="aws_default")
+    s3 = hook.get_conn()
 
     # S3 오브젝트 메타데이터로 ETag 확인
     head = s3.head_object(Bucket=S3_BUCKET, Key=S3_KEY)
