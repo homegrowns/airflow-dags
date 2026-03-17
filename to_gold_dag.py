@@ -139,6 +139,7 @@ def parquet_to_jsonl(**ctx) -> None:
     """
     import pandas as pd
     import io
+    import numpy as np
 
     skip = ctx["ti"].xcom_pull(task_ids="fetch_from_s3", key="skip")
     if skip and INPUT_PATH.exists():
