@@ -138,17 +138,21 @@ def parquet_to_jsonl(**ctx) -> None:
                     is_threat, threat_level, alert_count
     """
     import pandas as pd
+    import io
 
     skip = ctx["ti"].xcom_pull(task_ids="fetch_from_s3", key="skip")
     if skip and INPUT_PATH.exists():
         logger.info("S3 변경 없음 — parquet 변환 스킵")
         return
+    
+    # 로컬 파일 대신 s3에서 직접 읽기
+    # if not PARQUET_PATH.exists():
+     #   raise FileNotFoundError(f"Parquet 파일 없음: {PARQUET_PATH}")
 
-    if not PARQUET_PATH.exists():
-        raise FileNotFoundError(f"Parquet 파일 없음: {PARQUET_PATH}")
-
-    logger.info("Parquet 로드: %s", PARQUET_PATH)
-    df = pd.read_parquet(PARQUET_PATH)
+    logger.info("S3에서 parquet 직접 로드: %s", PARQUET_PATH)
+    s3 = boto3.client("s3")
+    obj = s3.get_object(Bucket=S3_BUCKET, Key=S3_KEY)
+    df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
     logger.info("  행 수: %d / 컬럼: %s", len(df), list(df.columns))
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
