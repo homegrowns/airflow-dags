@@ -154,6 +154,19 @@ def parquet_to_jsonl(**ctx) -> None:
     obj = s3.get_object(Bucket=S3_BUCKET, Key=S3_KEY)
     df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
     logger.info("  행 수: %d / 컬럼: %s", len(df), list(df.columns))
+    
+    def _convert(v):
+        if isinstance(v, float) and v != v:
+            return None
+        if isinstance(v, np.integer):
+            return int(v)
+        if isinstance(v, np.floating):
+            return None if np.isnan(v) else float(v)
+        if isinstance(v, np.ndarray):
+            return v.tolist()
+        if isinstance(v, np.bool_):
+            return bool(v)
+        return v
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     count = 0
@@ -169,11 +182,8 @@ def parquet_to_jsonl(**ctx) -> None:
                     record["timeline"] = []
 
             # NaN → None 정리
-            record = {
-                k: (None if (isinstance(v, float) and v != v) else v)
-                for k, v in record.items()
-            }
-
+            record = {k: _convert(v) for k v in record.item()}
+            
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
             count += 1
 
