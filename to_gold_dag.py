@@ -89,7 +89,9 @@ def fetch_from_s3(**ctx) -> None:
     etag_path = DATA_DIR / ".last_etag"
 
     # ← region_name 제거, 인자 없이 사용 (성공한 DAG와 동일 방식)
-    s3 = boto3.client("s3")
+    # s3 = boto3.client("s3")
+    hook = S3Hook(aws_conn_id="aws_default")
+    s3 = hook.get_conn()
 
     # ── 임시 진단: 버킷 루트 목록 확인 ──
     try:
