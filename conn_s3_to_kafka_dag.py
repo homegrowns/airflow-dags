@@ -31,13 +31,11 @@ def delivery_report(err, msg):
 def s3_to_kafka():
     total_rows = 0
     bootstrap = "kafka-broker-headless.kafka.svc.cluster.local:9092"
-    # 또는 더 짧게
-    # bootstrap = "kafka-broker-headless.kafka:9092"
 
     producer = Producer({"bootstrap.servers": bootstrap})
     s3 = boto3.client("s3")
     bucket = "malware-project-bucket"
-    prefix = "honeypot/raw/zeek/conn/2026-02-23/"
+    prefix = "bronze/conn.json"
 
     response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
 
