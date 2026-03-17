@@ -182,7 +182,7 @@ def parquet_to_jsonl(**ctx) -> None:
                     record["timeline"] = []
 
             # NaN → None 정리
-            record = {k: _convert(v) for k v in record.item()}
+            record = {k: _convert(v) for k, v in record.items()}
             
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
             count += 1
