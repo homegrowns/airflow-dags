@@ -43,7 +43,6 @@ S3 경로 (dag_unified_to_gold 와 동일):
 
 Neo4j 접속 정보:
   Airflow Variable  : NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD
-  기본값            : bolt://neo4j:7687 / neo4j / lindaliam
 
 Author : Linda
 """
@@ -63,6 +62,8 @@ from airflow import DAG
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator
 
+from airflow.models import Variable
+
 logger = logging.getLogger(__name__)
 
 # ── S3 설정 (dag_unified_to_gold 와 동일) ────────────────────────────────────
@@ -76,9 +77,9 @@ AWS_REGION     = "ap-northeast-2"
 ETAG_XCOM_KEY = "gold_etags"
 
 # ── Neo4j 설정 ────────────────────────────────────────────────────────────────
-NEO4J_URI      = ""
-NEO4J_USER     = ""
-NEO4J_PASSWORD = ""
+NEO4J_URI      = Variable.get("NEO4J_URI")
+NEO4J_USER     = Variable.get("NEO4J_USER")
+NEO4J_PASSWORD = Variable.get("NEO4J_PASSWORD")
 
 # 배치 크기 (UNWIND 한 번에 처리할 레코드 수)
 BATCH_SIZE = 10000
