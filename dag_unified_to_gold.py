@@ -47,6 +47,8 @@ Author : Linda
 
 from __future__ import annotations
 
+from airflow.sdk import Asset  # Airflow 3
+
 import io
 import json
 import logging
@@ -81,6 +83,11 @@ RELATION_OUT = OUTPUT_DIR / "relation_gold.jsonl"
 
 # ── ETag 캐시 경로 ────────────────────────────────────────────────────────────
 ETAG_PATH    = DATA_DIR / ".last_etag"
+
+# Asset 선언 (URI는 논리적 식별자)
+GOLD_SESSION_ASSET  = Asset("s3://malware-project-bucket/gold/session_gold.jsonl")
+GOLD_ENTITY_ASSET   = Asset("s3://malware-project-bucket/gold/entity_gold.jsonl")
+GOLD_RELATION_ASSET = Asset("s3://malware-project-bucket/gold/relation_gold.jsonl")
 
 logger = logging.getLogger(__name__)
 
@@ -692,6 +699,7 @@ with DAG(
     t_report = PythonOperator(
         task_id="report_stats",
         python_callable=report_stats,
+        outlets=[GOLD_SESSION_ASSET, GOLD_ENTITY_ASSET, GOLD_RELATION_ASSET],  # Airflow 3 Asset 선언
     )
 
     t_fetch >> t_convert >> t_validate >> t_sessions >> t_entities >> t_relations >> t_report
