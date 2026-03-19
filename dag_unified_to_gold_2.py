@@ -793,7 +793,7 @@ def report_stats(**ctx) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 default_args = {
-    "owner":            "cti_lab",
+    "owner":            "linda",
     "depends_on_past":  False,
     "retries":          1,
     "retry_delay":      timedelta(minutes=3),

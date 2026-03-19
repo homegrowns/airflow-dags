@@ -86,9 +86,11 @@ S3_RELATION_KEY = "gold/relation_gold.jsonl"
 AWS_REGION      = "ap-northeast-2"
 
 # ── Neo4j 설정 ────────────────────────────────────────────────────────────────
-NEO4J_URI      = Variable.get("NEO4J_URI")
-NEO4J_USER     = Variable.get("NEO4J_USER")
-NEO4J_PASSWORD = Variable.get("NEO4J_PASSWORD")
+# Variable.get()은 DAG 파싱 시점에 실행되면 VARIABLE_NOT_FOUND 에러 발생
+# → 모듈 레벨에서 읽지 않고 _neo4j_driver() 함수 안에서만 호출
+NEO4J_URI      = "bolt://localhost:7687"   # fallback default (Variable 미등록 시)
+NEO4J_USER     = "neo4j"
+NEO4J_PASSWORD = "lindaliam"
 
 BATCH_SIZE = 10000
 
@@ -560,7 +562,7 @@ def report_stats(**ctx) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 default_args = {
-    "owner":            "cti_lab",
+    "owner":            "linda",
     "depends_on_past":  False,
     "retries":          2,
     "retry_delay":      timedelta(minutes=2),
