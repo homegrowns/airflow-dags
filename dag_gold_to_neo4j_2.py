@@ -570,7 +570,7 @@ default_args = {
 }
 
 with DAG(
-    dag_id="gold_to_neo4j_2",
+    dag_id="gold_to_neo4j",
     description="Gold JSONL (S3) → Neo4j 그래프 적재 (v4 — SSL 포함)",
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
