@@ -90,7 +90,7 @@ AWS_REGION      = "ap-northeast-2"
 # → 모듈 레벨에서 읽지 않고 _neo4j_driver() 함수 안에서만 호출
 NEO4J_URI      = "bolt://localhost:7687"   # fallback default (Variable 미등록 시)
 NEO4J_USER     = "neo4j"
-NEO4J_PASSWORD = "lindaliam"
+NEO4J_PASSWORD = ""
 
 BATCH_SIZE = 10000
 
