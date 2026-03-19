@@ -86,11 +86,12 @@ S3_RELATION_KEY = "gold/relation_gold.jsonl"
 AWS_REGION      = "ap-northeast-2"
 
 # ── Neo4j 설정 ────────────────────────────────────────────────────────────────
-# Variable.get()은 DAG 파싱 시점에 실행되면 VARIABLE_NOT_FOUND 에러 발생
-# → 모듈 레벨에서 읽지 않고 _neo4j_driver() 함수 안에서만 호출
-NEO4J_URI      = "bolt://localhost:7687"   # fallback default (Variable 미등록 시)
-NEO4J_USER     = "neo4j"
-NEO4J_PASSWORD = ""
+# Variable.get()은 task 실행 시점에만 호출 (_neo4j_driver 함수 안에서)
+# 모듈 레벨에서 호출하면 DAG 파싱 시 VARIABLE_NOT_FOUND 에러 발생
+# Airflow Admin → Variables 에서 아래 3개 등록 필요:
+#   NEO4J_URI      = bolt://<neo4j-service-host>:7687
+#   NEO4J_USER     = neo4j
+#   NEO4J_PASSWORD = <password>
 
 BATCH_SIZE = 10000
 
@@ -120,9 +121,9 @@ def _s3_read_jsonl(s3_key: str) -> list[dict]:
 
 def _neo4j_driver():
     from neo4j import GraphDatabase
-    uri  = Variable.get("NEO4J_URI",      default_var=NEO4J_URI)
-    user = Variable.get("NEO4J_USER",     default_var=NEO4J_USER)
-    pw   = Variable.get("NEO4J_PASSWORD", default_var=NEO4J_PASSWORD)
+    uri  = Variable.get("NEO4J_URI")
+    user = Variable.get("NEO4J_USER")
+    pw   = Variable.get("NEO4J_PASSWORD")
     return GraphDatabase.driver(uri, auth=(user, pw))
 
 
