@@ -741,18 +741,9 @@ def extract_relations(**ctx) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def report_stats(**ctx) -> None:
-    # skip 여부와 무관하게 outlet_events는 항상 emit
-    # skip=True일 때도 gold_to_neo4j 트리거가 되어야 하기 때문
-    # (S3 파일 미변경 = gold도 그대로 = neo4j 재적재 불필요하지만 의존성 체인은 유지)
-    outlet_events = ctx.get("outlet_events")
-    if outlet_events is not None:
-        outlet_events.add(GOLD_SESSION_ASSET, extra={"source": "unified_to_gold"})
-        outlet_events.add(GOLD_ENTITY_ASSET, extra={"source": "unified_to_gold"})
-        outlet_events.add(GOLD_RELATION_ASSET, extra={"source": "unified_to_gold"})
-
     skip = ctx["ti"].xcom_pull(task_ids="fetch_from_s3", key="skip")
     if skip:
-        logger.info("S3 변경 없음 — gold 재처리 스킵 (Asset event는 발행 완료)")
+        logger.info("S3 변경 없음 — report_stats 스킵")
         return
 
     ti = ctx["ti"]
