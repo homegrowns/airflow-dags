@@ -810,7 +810,7 @@ default_args = {
 }
 
 with DAG(
-    dag_id="unified_events_to_gold",
+    dag_id="unified_events_to_gold_2",
     description="S3 parquet → session/entity/relation gold 전처리 (5분 주기)",
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
