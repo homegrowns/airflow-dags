@@ -18,9 +18,10 @@ Pipeline:
   [report_rag_stats]      ← 처리 건수 / 필터 현황 / 분류 분포 로그 출력
 
 설계 원칙:
-  - Spark가 S3에 올린 unified_events.parquet 소비
-  - whitelist.py의 is_whitelisted_session() + should_include() 로직 인라인 사용
-  - unified_to_gold의 extract_sessions 전처리 로직 인라인 사용
+  - gold_to_neo4j / unified_to_gold DAG와 완전 독립 (Asset 트리거, 외부 DAG import 없음)
+  - Spark가 S3에 올린 unified_events.parquet 을 직접 소비
+  - whitelist.py의 is_whitelisted_session() + should_include() 로직 인라인 재사용
+  - unified_to_gold의 extract_sessions 전처리 로직 인라인 재사용
   - Neo4j는 과거 행위 enrichment 전용 (세션 속성의 단일 소스는 parquet)
   - Neo4j에 해당 session_id 없으면 neighbors=[] 로 처리 → 현재 세션만으로 RAG 실행
 
@@ -121,31 +122,52 @@ SUSPICION_THRESHOLD = 30
 _CATEGORY_TO_CLASSTYPE: dict[str, str] = {
     # SQLi / XSS / LFI / RFI / WebShell 등 웹 취약점 직접 공격
     "Web Application Attack":                 "web-application-attack",
+
     # RAT, 백도어, 봇넷 에이전트 등 악성코드가 이미 감염된 호스트에서 통신
     "A Network Trojan was detected":          "trojan-activity",
+
     # 위 범주에 안 들어가는 기타 공격 (Exploit 시도, 프로토콜 남용 등)
     "Misc Attack":                            "misc-attack",
+
     # 악성으로 확정하기 어렵지만 의심스러운 트래픽 (C2 후보, DGA 도메인 등)
     "Potentially Bad Traffic":                "bad-unknown",
-     # Nmap, Masscan 등 포트/서비스 스캐닝 행위
+
+    # Nmap, Masscan 등 포트/서비스 스캐닝 행위
     "Detection of a Network Scan":            "network-scan",
+
     # Suricata가 정상으로 판단한 트래픽 (오탐 가능성 있음)
     "Not Suspicious Traffic":                 "not-suspicious",
+
     # sudo 탈취, SUID 악용 등 관리자 권한 획득 시도 (수평이동/권한상승)
     "Attempted Administrator Privilege Gain": "misc-attack",
+
     # 일반 사용자 권한 획득 시도 (웹쉘 → 로컬 사용자 전환 등)
     "Attempted User Privilege Gain":          "misc-attack",
+
     # HTTP/DNS/SMB 등 프로토콜 구조 자체를 디코딩하다 이상 패턴 감지
-    # → C2 터널링, 비표준 인코딩 등에서 자주 발생하지만 오탐도 많음
+    # → C2 터널링, 비표준 인코딩 등에서 자주 발생
     "Generic Protocol Command Decode":        "bad-unknown",
+
     # 룰 매칭은 됐지만 카테고리 분류 불가 (커스텀 룰 또는 구버전 룰셋)
-    "Unknown Traffic":                        "unknown",
+    "Unknown Traffic":                               "unknown",
+    # 감염 후 C2 통신 의심, 매우 중요
+    "Malware Command and Control Activity Detected": "command-and-control",
 }
 
 _CLASSTYPE_RANK: dict[str, int] = {
-    "web-application-attack": 3, "trojan-activity": 3, "command-and-control": 3, "misc-attack": 3,
-    "bad-unknown": 2,            "network-scan": 2,
-    "not-suspicious": 1,         "unknown": 1,          
+    # rank 3 — 확실한 악성 신호: 즉시 분석 대상
+    "web-application-attack": 3,  # 웹 직접 공격
+    "trojan-activity":        3,  # 감염 호스트 통신
+    "command-and-control":    3,  # C2 서버 통신 (ET Pro 룰에서 주로 발생)
+    "misc-attack":            3,  # 권한상승 시도 등 기타 공격 (whitelist.py v2 기준)
+
+    # rank 2 — 의심 신호: severity/반복 횟수로 추가 판단
+    "bad-unknown":            2,  # 악성 의심 but 미확정
+    "network-scan":           2,  # 스캐닝 (whitelist.py v2 기준 상향)
+
+    # rank 1 — 낮은 신호: SUSPICION_THRESHOLD 단독으로는 거의 필터링됨
+    "not-suspicious":         1,  # 정상 판정 (오탐 제거용)
+    "unknown":                1,  # 분류 불가
 }
 
 
@@ -166,6 +188,7 @@ def _in_whitelist(ip: str | None) -> bool:
 
 
 def _is_whitelisted_session(session: dict) -> bool:
+    """whitelist.py is_whitelisted_session() 동일 로직."""
     for ev in session.get("timeline", []):
         if ev.get("source") == "zeek_conn":
             if _in_whitelist(ev.get("orig_h")):
@@ -176,16 +199,100 @@ def _is_whitelisted_session(session: dict) -> bool:
     return False
 
 
-def _calc_suspicion_score(session: dict) -> int:
-    """whitelist.py calc_suspicion_score() + extract_score_inputs() 통합."""
+def _get_session_src_ip(session: dict) -> str | None:
+    """세션에서 src_ip 추출 — zeek_conn → suricata 순으로 시도."""
+    for ev in session.get("timeline", []):
+        if ev.get("source") == "zeek_conn" and ev.get("orig_h"):
+            return ev["orig_h"]
+    for ev in session.get("timeline", []):
+        if ev.get("source") == "suricata" and ev.get("src_ip"):
+            return ev["src_ip"]
+    return None
+
+
+def _get_session_flow_start(session: dict) -> float | None:
+    """세션 flow_start -> epoch float 변환. 파싱 실패 시 None."""
+    from datetime import timezone
+    ts = session.get("flow_start")
+    if not ts:
+        return None
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    try:
+        from datetime import datetime as dt
+        ts_str = str(ts).replace(" ", "T")
+        if ts_str.endswith("Z"):
+            ts_str = ts_str[:-1] + "+00:00"
+        return dt.fromisoformat(ts_str).astimezone(timezone.utc).timestamp()
+    except Exception:
+        return None
+
+
+# 10초 창 기준
+REPEAT_WINDOW_SEC = 10
+
+
+def _build_repeat_count_map(sessions: list[dict]) -> dict[str, int]:
+    """
+    전체 세션 목록에서 src_ip별 10초 창 내 최대 등장 횟수를 계산.
+
+    알고리즘:
+      1. src_ip별 flow_start 타임스탬프 목록 수집
+      2. 정렬 후 슬라이딩 윈도우(10초)로 최대 밀집 구간 카운트
+      3. 각 세션의 community_id -> 해당 src_ip의 최대 카운트 반환
+
+    반환: { community_id(str): repeat_count(int) }
+    """
+    from collections import defaultdict
+
+    ip_ts: dict[str, list[float]] = defaultdict(list)
+    # community_id -> src_ip 인덱스 (나중에 역참조용)
+    cid_to_ip: dict[str, str] = {}
+
+    for sess in sessions:
+        src_ip = _get_session_src_ip(sess)
+        ts     = _get_session_flow_start(sess)
+        cid    = str(sess.get("community_id") or id(sess))
+        if src_ip and ts is not None:
+            ip_ts[src_ip].append(ts)
+            cid_to_ip[cid] = src_ip
+
+    # src_ip별 슬라이딩 윈도우 최대 카운트
+    ip_max_count: dict[str, int] = {}
+    for ip, ts_list in ip_ts.items():
+        ts_list.sort()
+        max_count = 1
+        left = 0
+        for right in range(len(ts_list)):
+            while ts_list[right] - ts_list[left] > REPEAT_WINDOW_SEC:
+                left += 1
+            max_count = max(max_count, right - left + 1)
+        ip_max_count[ip] = max_count
+
+    # community_id -> repeat_count 매핑
+    result: dict[str, int] = {}
+    for sess in sessions:
+        cid    = str(sess.get("community_id") or id(sess))
+        src_ip = cid_to_ip.get(cid)
+        result[cid] = ip_max_count.get(src_ip, 1) if src_ip else 1
+
+    return result
+
+
+def _calc_suspicion_score(session: dict, repeat_count: int = 1) -> int:
+    """
+    whitelist.py calc_suspicion_score() + extract_score_inputs() 통합.
+
+    repeat_count : 외부 주입값 (filter_whitelist에서 _build_repeat_count_map으로 계산).
+                   기본값 1 = 반복 없음 (단독 호출 시 하위 호환).
+                   기준: 동일 src_ip가 10초 창 내 등장한 세션 수.
+    """
     classtypes: list[str] = []
     severities: list[int] = []
-    alert_count = 0
 
     for ev in session.get("timeline", []):
         if ev.get("source") != "suricata" or not ev.get("signature"):
             continue
-        alert_count += 1
         ct = _CATEGORY_TO_CLASSTYPE.get(ev.get("category", ""), "unknown")
         classtypes.append(ct)
         sev = ev.get("severity")
@@ -211,11 +318,12 @@ def _calc_suspicion_score(session: dict) -> int:
         return {1: 30, 2: 20, 3: 10}.get(s, 0)
 
     def _repeat_score(cnt: int) -> int:
+        # 10초 창 내 동일 src_ip 세션 수 기준
         if cnt >= 5: return 20
         if cnt >= 3: return 10
         return 0
 
-    return _ct_score(highest_ct) + _sev_score(highest_sev) + _repeat_score(alert_count)
+    return _ct_score(highest_ct) + _sev_score(highest_sev) + _repeat_score(repeat_count)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -412,10 +520,16 @@ def filter_whitelist(**ctx) -> None:
     whitelist.py should_include() 동일 로직:
       1. src_ip 화이트리스트(IP/CIDR) 해당 시 제외
       2. suspicion_score < SUSPICION_THRESHOLD 시 제외
+
+    repeat_count: 동일 src_ip가 10초 창 내 등장한 세션 수 (전체 배치 기준 선계산).
     """
     raw_sessions: list[dict] = ctx["ti"].xcom_pull(
         task_ids="load_parquet", key="raw_sessions"
     ) or []
+
+    # 전체 세션에서 src_ip별 10초 창 반복 카운트 선계산
+    repeat_map = _build_repeat_count_map(raw_sessions)
+    logger.info("filter_whitelist: repeat_count_map 계산 완료 (%d 개 src_ip)", len(repeat_map))
 
     passed:   list[dict]     = []
     filtered: dict[str, int] = {"whitelist_ip": 0, "low_score": 0}
@@ -424,7 +538,9 @@ def filter_whitelist(**ctx) -> None:
         if _is_whitelisted_session(sess):
             filtered["whitelist_ip"] += 1
             continue
-        if _calc_suspicion_score(sess) < SUSPICION_THRESHOLD:
+        cid          = str(sess.get("community_id") or id(sess))
+        repeat_count = repeat_map.get(cid, 1)
+        if _calc_suspicion_score(sess, repeat_count=repeat_count) < SUSPICION_THRESHOLD:
             filtered["low_score"] += 1
             continue
         passed.append(sess)
@@ -593,7 +709,7 @@ You will be given:
 
 Analyze and respond ONLY in this JSON format (no markdown, no explanation):
 {
-  "threat_type": CATEGORY,
+  "threat_type": "<Web Application Attack | A Network Trojan was detected | Misc Attack | Potentially Bad Traffic | Detection of a Network Scan | Not Suspicious Traffic | Attempted Administrator Privilege Gain | Attempted User Privilege Gain | Generic Protocol Command Decode | Malware Command and Control Activity Detected | Unknown Traffic>",
   "summary": "<1~2문장 한국어 위협 요약>",
   "recommended_action": "<한 줄 대응 권고>"
 }
@@ -658,7 +774,7 @@ def run_rag_analysis(**ctx) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def save_rag_results(**ctx) -> None:
-    """분석 결과 → S3 rag_result/rag_results_{datetime}.jsonl 저장 ."""
+    """분석 결과 → S3 rag_result/rag_results.jsonl 저장 (덮어쓰기)."""
     results: list[dict] = ctx["ti"].xcom_pull(
         task_ids="run_rag_analysis", key="rag_results"
     ) or []
@@ -688,8 +804,7 @@ def report_rag_stats(**ctx) -> None:
     results      = ti.xcom_pull(task_ids="run_rag_analysis", key="rag_results")    or []
     saved_count  = ti.xcom_pull(task_ids="save_rag_results", key="saved_count")    or 0
 
-    threat_dist:     dict[str, int] = {}
-    # confidence_dist: dict[str, int] = {}
+    threat_dist: dict[str, int] = {}
     error_count = 0
 
     for r in results:
@@ -698,10 +813,10 @@ def report_rag_stats(**ctx) -> None:
             error_count += 1
             continue
         tt = a.get("threat_type", "Unknown")
-        # cf = a.get("confidence",  "unknown")
-        threat_dist[tt]     = threat_dist.get(tt, 0) + 1
-        # confidence_dist[cf] = confidence_dist.get(cf, 0) + 1
+        threat_dist[tt] = threat_dist.get(tt, 0) + 1
 
+    logger.info("=" * 70)
+    logger.info("▶ neo4j_to_rag 추론 파이프라인 완료 요약 (v3)")
     logger.info("=" * 70)
     logger.info("  [입력]  parquet 로드         : %d 세션", total_loaded)
     logger.info("  [필터]  화이트리스트 제외     : %d", filter_stats.get("whitelist_ip", 0))
@@ -712,9 +827,6 @@ def report_rag_stats(**ctx) -> None:
     logger.info("  [위협 유형 분포]")
     for tt, cnt in sorted(threat_dist.items(), key=lambda x: -x[1]):
         logger.info("    %-30s %d", tt, cnt)
-    # logger.info("  [신뢰도 분포]")
-    # for cf, cnt in sorted(confidence_dist.items(), key=lambda x: -x[1]):
-    #     logger.info("    %-10s %d", cf, cnt)
     logger.info("=" * 70)
 
 
