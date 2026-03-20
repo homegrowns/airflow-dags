@@ -593,7 +593,7 @@ You will be given:
 
 Analyze and respond ONLY in this JSON format (no markdown, no explanation):
 {
-  "threat_type": "<C2 | SQLi | Port Scan | Malware Download | Brute Force | Benign | Unknown>",
+  "threat_type": CATEGORY,
   "summary": "<1~2문장 한국어 위협 요약>",
   "recommended_action": "<한 줄 대응 권고>"
 }
@@ -627,7 +627,7 @@ def run_rag_analysis(**ctx) -> None:
                     {"role": "user",   "content": user_text},
                 ],
                 temperature=0.1,   # 구조화 JSON 출력 → 낮은 temperature 유지
-                max_tokens=512,
+                max_tokens=1024,
             )
             raw = response.choices[0].message.content.strip()
             try:
