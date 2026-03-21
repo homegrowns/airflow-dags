@@ -188,19 +188,29 @@ def _in_whitelist(ip: str | None) -> bool:
 
 
 def _is_whitelisted_session(session: dict) -> bool:
-    """whitelist.py is_whitelisted_session() 동일 로직."""
+    """
+    겉 틀의 src_ip(conn 기준 orig_h)만 체크.
+    parquet 겉 틀에 src_ip가 없으면 timeline zeek_conn → suricata 순 fallback.
+    """
+    # 겉 틀 src_ip 우선 (preprocess.py v6 이후)
+    if session.get("src_ip") is not None:
+        return _in_whitelist(session["src_ip"])
+    # fallback: timeline 순회
     for ev in session.get("timeline", []):
         if ev.get("source") == "zeek_conn":
-            if _in_whitelist(ev.get("orig_h")):
-                return True
-        elif ev.get("source") == "suricata":
-            if _in_whitelist(ev.get("src_ip")):
-                return True
+            return _in_whitelist(ev.get("orig_h"))
+        if ev.get("source") == "suricata":
+            return _in_whitelist(ev.get("src_ip"))
     return False
 
 
 def _get_session_src_ip(session: dict) -> str | None:
-    """세션에서 src_ip 추출 — zeek_conn → suricata 순으로 시도."""
+    """
+    src_ip 추출 — 겉 틀 우선, 없으면 timeline zeek_conn → suricata 순 fallback.
+    preprocess.py v6 이후 겉 틀에 src_ip가 있으면 timeline 순회 불필요.
+    """
+    if session.get("src_ip") is not None:
+        return session["src_ip"]
     for ev in session.get("timeline", []):
         if ev.get("source") == "zeek_conn" and ev.get("orig_h"):
             return ev["orig_h"]
@@ -336,8 +346,8 @@ def _extract_conn(timeline: list[dict]) -> dict:
             return {
                 "src_ip":       ev.get("orig_h"),
                 "src_port":     ev.get("orig_p"),
-                "dst_ip":       ev.get("resp_h"),
-                "dst_port":     ev.get("resp_p"),
+                "dest_ip":      ev.get("resp_h"),
+                "dest_port":    ev.get("resp_p"),
                 "proto":        ev.get("proto"),
                 "service":      ev.get("service"),
                 "duration":     ev.get("duration"),
@@ -355,8 +365,8 @@ def _extract_conn(timeline: list[dict]) -> dict:
             return {
                 "src_ip":       ev.get("src_ip"),
                 "src_port":     str(ev.get("src_port", "")),
-                "dst_ip":       ev.get("dest_ip"),
-                "dst_port":     str(ev.get("dest_port", "")),
+                "dest_ip":      ev.get("dest_ip"),
+                "dest_port":    str(ev.get("dest_port", "")),
                 "proto":        ev.get("proto", "").lower(),
                 **{k: None for k in ["service", "duration", "orig_bytes", "resp_bytes",
                                      "conn_state", "missed_bytes", "history",
@@ -675,8 +685,8 @@ def _subgraph_to_text(subgraph: dict) -> str:
     lines = [
         "[현재 세션 정보]",
         f"  session_id   : {s.get('session_id')}",
-        f"  src_ip       : {s.get('src_ip')}  →  dst_ip : {s.get('dst_ip')}",
-        f"  proto        : {s.get('proto')}       port   : {s.get('dst_port')}",
+        f"  src_ip       : {s.get('src_ip')}  →  dest_ip : {s.get('dest_ip')}",
+        f"  proto        : {s.get('proto')}       port    : {s.get('dest_port')}",
         f"  alert_count  : {s.get('alert_count')}   max_severity : {s.get('max_severity')}",
         f"  conn_state   : {s.get('conn_state') or 'N/A'}",
         f"  tls_sni      : {s.get('tls_sni') or 'N/A'}",
@@ -743,7 +753,7 @@ def run_rag_analysis(**ctx) -> None:
                     {"role": "user",   "content": user_text},
                 ],
                 temperature=0.1,   # 구조화 JSON 출력 → 낮은 temperature 유지
-                max_tokens=1024,
+                max_tokens=512,
             )
             raw = response.choices[0].message.content.strip()
             try:
@@ -755,13 +765,21 @@ def run_rag_analysis(**ctx) -> None:
                 except json.JSONDecodeError:
                     analysis = {"raw_response": raw, "parse_error": True}
 
-            results.append({"session_id": session_id, "session": sg["session"],
-                             "analysis": analysis})
+            results.append({
+                "session_id": session_id,
+                "uid":        sg["session"].get("uid"),   # 원본 로그 역추적용
+                "session":    sg["session"],
+                "analysis":   analysis,
+            })
 
         except Exception as e:
             logger.error("run_rag_analysis: session_id=%s 오류 — %s", session_id, e)
-            results.append({"session_id": session_id, "session": sg["session"],
-                             "analysis": {"error": str(e)}})
+            results.append({
+                "session_id": session_id,
+                "uid":        sg["session"].get("uid"),
+                "session":    sg["session"],
+                "analysis":   {"error": str(e)},
+            })
 
         time.sleep(GROQ_RPM_SLEEP)
 
@@ -850,7 +868,7 @@ with DAG(
     schedule="*/5 * * * *",   # unified_to_gold와 동일 주기, 완전 독립 실행
     catchup=False,
     max_active_runs=1,
-    tags=["graph-rag", "groq"],
+    tags=["cti", "graph-rag", "groq"],
 ) as dag:
 
     t_load     = PythonOperator(task_id="load_parquet",       python_callable=load_parquet)
