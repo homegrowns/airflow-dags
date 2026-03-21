@@ -755,7 +755,7 @@ def run_rag_analysis(**ctx) -> None:
                     {"role": "user",   "content": user_text},
                 ],
                 temperature=0.1,   # 구조화 JSON 출력 → 낮은 temperature 유지
-                max_tokens=512,
+                max_tokens=1024,
             )
             raw = response.choices[0].message.content.strip()
             try:
@@ -867,7 +867,7 @@ with DAG(
     description="실시간 추론 DAG — S3 parquet → whitelist → session_gold → Neo4j enrichment → Groq RAG (v3)",
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
-    schedule="*/5 * * * *",   # unified_to_gold와 동일 주기, 완전 독립 실행
+    schedule="*/10 * * * *",   # unified_to_gold와 동일 주기, 완전 독립 실행
     catchup=False,
     max_active_runs=1,
     tags=["cti", "graph-rag", "groq"],
