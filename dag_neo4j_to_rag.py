@@ -344,6 +344,7 @@ def _extract_conn(timeline: list[dict]) -> dict:
     for ev in timeline:
         if ev.get("source") == "zeek_conn":
             return {
+                "uid":          ev.get("uid"),          # zeek conn uid (원본 역추적용)
                 "src_ip":       ev.get("orig_h"),
                 "src_port":     ev.get("orig_p"),
                 "dest_ip":      ev.get("resp_h"),
@@ -463,7 +464,8 @@ def _to_session_gold(raw_session: dict, session_id: str) -> dict:
     return {
         "session_id":     session_id,
         "community_id":   raw_session.get("community_id"),
-        **conn,
+        **conn,                                                    # uid 포함 (zeek_conn에서 추출)
+        "uid":            raw_session.get("uid") or conn.get("uid"),  # 겉 틀 우선, 없으면 timeline
         **http,
         **dns,
         **ssl,
