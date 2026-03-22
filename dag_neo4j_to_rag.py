@@ -466,6 +466,7 @@ def _to_session_gold(raw_session: dict, session_id: str) -> dict:
         "community_id":   raw_session.get("community_id"),
         **conn,                                                    # uid 포함 (zeek_conn에서 추출)
         "uid":            raw_session.get("uid") or conn.get("uid"),  # 겉 틀 우선, 없으면 timeline
+        "ts":             conn.get("ts") or raw_session.get("flow_start"),
         **http,
         **dns,
         **ssl,
