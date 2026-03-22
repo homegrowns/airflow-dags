@@ -115,7 +115,7 @@ MERGE (s:Session {session_id: r.session_id})
 SET
   s.community_id           = r.community_id,
   s.uid                    = r.uid,
-  r.ts                     = r.ts,
+  s.ts                     = r.ts,
   s.src_ip                 = r.src_ip,
   s.src_port               = r.src_port,
   s.dest_ip                = r.dest_ip,
@@ -294,6 +294,7 @@ _CONSTRAINTS = [
 _INDEXES = [
     "CREATE INDEX IF NOT EXISTS FOR (n:Session) ON (n.community_id)",
     "CREATE INDEX IF NOT EXISTS FOR (n:Session) ON (n.uid)",           # [신규 v5]
+    "CREATE INDEX IF NOT EXISTS FOR (n:Session) ON (n.ts)",
     "CREATE INDEX IF NOT EXISTS FOR (n:Session) ON (n.is_threat)",
     "CREATE INDEX IF NOT EXISTS FOR (n:Session) ON (n.src_ip)",
     "CREATE INDEX IF NOT EXISTS FOR (n:Session) ON (n.dest_ip)",       # [v5]

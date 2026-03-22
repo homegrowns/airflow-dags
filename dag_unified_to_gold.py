@@ -319,6 +319,7 @@ def extract_sessions(**ctx) -> None:
             "session_id":   session_id,
             "community_id": cid,
             "uid":          conn.get("uid"),            # [신규 v5]
+            "ts":           conn.get("ts"),
             "src_ip":       conn.get("src_ip"),
             "src_port":     conn.get("src_port"),
             "dest_ip":      conn.get("dest_ip"),        # [v5]
