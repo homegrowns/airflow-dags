@@ -186,6 +186,7 @@ def _extract_conn(timeline: list[dict]) -> dict:
         if ev.get("source") == "zeek_conn":
             return {
                 "uid":          ev.get("uid"),          # [신규 v5]
+                "ts":           ev.get("ts"),
                 "src_ip":       ev.get("orig_h"),
                 "src_port":     ev.get("orig_p"),
                 "dest_ip":      ev.get("resp_h"),       # [v5] dst_ip → dest_ip
