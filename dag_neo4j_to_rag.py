@@ -644,12 +644,17 @@ def build_subgraphs(**ctx) -> None:
     UNWIND $session_ids AS sid
     MATCH (s:Session {session_id: sid})-[r]->(n)
     RETURN
-        sid          AS session_id,
-        type(r)      AS rel_type,
-        labels(n)    AS node_labels,
-        n.value      AS node_value,
-        n.signature  AS signature,
-        n.category   AS category
+        sid                       AS session_id,
+        type(r)                   AS rel_type,
+        labels(n)                 AS node_labels,
+        n.value                   AS node_value,
+        n.signature               AS signature,
+        n.category                AS category,
+        n.first_seen              AS first_seen,
+        n.last_seen               AS last_seen,
+        n.related_session_count   AS related_session_count,
+        n.total_orig_bytes        AS total_orig_bytes,
+        n.total_resp_bytes        AS total_resp_bytes
     """
 
     total_edges = 0
@@ -661,11 +666,16 @@ def build_subgraphs(**ctx) -> None:
             for record in result:
                 sid = record["session_id"]
                 neighbor_map[sid].append({
-                    "rel_type":    record["rel_type"],
-                    "node_labels": record["node_labels"],
-                    "node_value":  record["node_value"],
-                    "signature":   record["signature"],
-                    "category":    record["category"],
+                    "rel_type":             record["rel_type"],
+                    "node_labels":          record["node_labels"],
+                    "node_value":           record["node_value"],
+                    "signature":            record["signature"],
+                    "category":             record["category"],
+                    "first_seen":           str(record["first_seen"])  if record["first_seen"]  else None,
+                    "last_seen":            str(record["last_seen"])   if record["last_seen"]   else None,
+                    "related_session_count": record["related_session_count"],
+                    "total_orig_bytes":     record["total_orig_bytes"],
+                    "total_resp_bytes":     record["total_resp_bytes"],
                 })
                 total_edges += 1
     driver.close()
