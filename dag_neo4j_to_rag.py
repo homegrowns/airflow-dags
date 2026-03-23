@@ -793,6 +793,7 @@ def run_rag_analysis(**ctx) -> None:
                     **analysis,
                     "threat_score": sg["session"].get("suspicion_score", 0),
                 },
+                "neighbors": sg.get("neighbors", []),   # 정상 케이스
             })
 
         except Exception as e:
@@ -802,6 +803,7 @@ def run_rag_analysis(**ctx) -> None:
                 "uid":        sg["session"].get("uid"),
                 "session":    sg["session"],
                 "analysis":   {"error": str(e)},
+                "neighbors": sg.get("neighbors", []),   # 오류 케이스
             })
 
         time.sleep(GROQ_RPM_SLEEP)
