@@ -8,7 +8,7 @@ from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
-
+from urllib.parse import unquote_plus
 import boto3
 
 from airflow import DAG
@@ -16,6 +16,7 @@ from airflow.operators.python import PythonOperator
 from airflow.decorators import task
 from airflow.providers.amazon.aws.sensors.sqs import SqsSensor
 from airflow.sdk import Asset
+
 
 # ── S3 설정 ───────────────────────────────────────────────────────────────────
 S3_BUCKET = "malware-project-bucket"
@@ -43,87 +44,55 @@ logger = logging.getLogger(__name__)
 
 # ── 공통 S3 헬퍼 ──────────────────────────────────────────────────────────────
 
-import json
-from urllib.parse import unquote_plus
-
-from airflow.decorators import task
-
-
 @task(task_id="parse_s3_event")
 def parse_s3_event(messages):
     if not messages:
-        return {
-            "skip": True,
-            "reason": "empty_messages",
-        }
+        return {"skip": True, "reason": "empty_messages"}
 
     body = json.loads(messages[0]["Body"])
 
-    # S3 bucket notification 생성 직후 들어오는 테스트 이벤트
     if body.get("Event") == "s3:TestEvent":
-        return {
-            "skip": True,
-            "reason": "s3_test_event",
-        }
+        return {"skip": True, "reason": "s3_test_event"}
 
     records = body.get("Records", [])
     if not records:
-        return {
-            "skip": True,
-            "reason": "no_records",
-        }
+        return {"skip": True, "reason": "no_records"}
 
-    record = records[0]
-    bucket = record["s3"]["bucket"]["name"]
-    raw_key = record["s3"]["object"]["key"]
-    key = unquote_plus(raw_key)
-    event_name = record.get("eventName")
+    valid_records = []
 
-    # 원하는 prefix 아니면 스킵
-    if not key.startswith("silver/common_records/"):
-        return {
-            "skip": True,
-            "reason": "unexpected_prefix",
+    for record in records:
+        bucket = record["s3"]["bucket"]["name"]
+        raw_key = record["s3"]["object"]["key"]
+        key = unquote_plus(raw_key)
+        event_name = record.get("eventName")
+
+        if not key.startswith("silver/common_records/"):
+            continue
+
+        if "/_temporary/" in key or key.startswith("_temporary/"):
+            continue
+
+        if key.endswith("/_SUCCESS") or key.endswith("_SUCCESS"):
+            continue
+
+        if "/rejected_records/" in key or key.startswith("rejected_records/"):
+            continue
+
+        if not key.endswith(".parquet"):
+            continue
+
+        valid_records.append({
             "bucket": bucket,
             "key": key,
             "event_name": event_name,
-        }
+        })
 
-    # Spark/Glue 임시 파일 경로 무시
-    if "/_temporary/" in key or key.startswith("_temporary/"):
-        return {
-            "skip": True,
-            "reason": "temporary_file",
-            "bucket": bucket,
-            "key": key,
-            "event_name": event_name,
-        }
-
-    # 완료 마커 파일 무시
-    if key.endswith("/_SUCCESS") or key.endswith("_SUCCESS"):
-        return {
-            "skip": True,
-            "reason": "success_marker",
-            "bucket": bucket,
-            "key": key,
-            "event_name": event_name,
-        }
-
-    # parquet 아니면 스킵
-    if not key.endswith(".parquet"):
-        return {
-            "skip": True,
-            "reason": "not_parquet",
-            "bucket": bucket,
-            "key": key,
-            "event_name": event_name,
-        }
+    if not valid_records:
+        return {"skip": True, "reason": "no_valid_records"}
 
     return {
         "skip": False,
-        "bucket": bucket,
-        "key": key,
-        "event_name": event_name,
+        "records": valid_records,
     }
 # ── Task 0-1 : fetch_from_s3 ──────────────────────────────────────────────────
 
