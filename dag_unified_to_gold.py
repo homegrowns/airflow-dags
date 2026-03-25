@@ -858,7 +858,7 @@ default_args = {
 
 with DAG(
     dag_id="unified_events_to_gold",
-    description="Spark silver parquet → session/entity/relation gold 전처리 v7",
+    description="Spark silver parquet → session/entity/relation gold 전처리",
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
     schedule="*/10 * * * *",
