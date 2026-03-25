@@ -699,7 +699,7 @@ with DAG(
         message_filtering="jsonpath-ext",
         message_filtering_config="Records[?@.s3.object.key]",
         delete_message_on_reception=True,
-         message_filtering_match_values={"*_SUCCESS"},
+        message_filtering_match_values={"*_SUCCESS"},
     )
 
     parsed_event = parse_s3_event(wait_for_sqs.output)
