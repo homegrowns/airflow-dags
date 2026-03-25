@@ -110,7 +110,7 @@ S3_RELATION_KEY = "gold/relation_gold.jsonl"
 AWS_REGION = "ap-northeast-2"
 
 DATA_DIR           = Path("/opt/airflow/data")
-LAST_MODIFIED_PATH = DATA_DIR / ".last_silver_modified"  #   ETag → LastModified
+LAST_MODIFIED_PATH = DATA_DIR / ".last_silver_modified"  # [v6] ETag → LastModified
 
 GOLD_SESSION_ASSET  = Asset("s3://malware-project-bucket/gold/session_gold.jsonl")
 GOLD_ENTITY_ASSET   = Asset("s3://malware-project-bucket/gold/entity_gold.jsonl")
@@ -140,7 +140,7 @@ def _s3_write_jsonl(s3_key: str, records: list[dict]) -> None:
     logger.info("S3 업로드 완료: s3://%s/%s (%d 레코드)", S3_BUCKET, s3_key, len(records))
 
 
-# ──   silver prefix 헬퍼 ───────────────────────────────────────────────────
+# ── [v6] silver prefix 헬퍼 ───────────────────────────────────────────────────
 
 def _list_silver_parquet_keys() -> list[str]:
     """silver/common_records/ prefix 아래 모든 .parquet 파일 키 반환."""
@@ -163,7 +163,7 @@ def _latest_silver_modified(keys: list[str]) -> str | None:
     return max(times)
 
 
-# ──   Unix ms timestamp → ISO UTC 문자열 ───────────────────────────────────
+# ── [v6] Unix ms timestamp → ISO UTC 문자열 ───────────────────────────────────
 
 def _ms_to_iso(ms: Any) -> str | None:
     """
@@ -206,7 +206,7 @@ def fetch_from_s3(**ctx) -> None:
     ctx["ti"].xcom_push(key="parquet_keys", value=keys)
 
 
-# ──   silver parquet 로딩 공통 헬퍼 ───────────────────────────────────────
+# ── [v7] silver parquet 로딩 공통 헬퍼 ───────────────────────────────────────
 
 def _load_silver_records(ctx) -> list[dict]:
     """
@@ -330,7 +330,7 @@ def validate_input(**ctx) -> None:
 
 def _extract_conn(row: dict, timeline: list[dict]) -> dict:
     """
-      conn 정보 추출 우선순위:
+    [v6] conn 정보 추출 우선순위:
       1. top-level src_ip/dest_ip (Spark coalesce 확정값)
       2. zeek_conn: uid + conn 세부 필드(bytes/pkts/state 등) 보완
          - orig_h/resp_h 는 top-level 이 None 인 경우에만 IP 보완
@@ -392,7 +392,7 @@ def _extract_conn(row: dict, timeline: list[dict]) -> dict:
 
 def _extract_http(timeline: list[dict]) -> dict:
     """
-      현재 zeek_http 이벤트 실측 필드: source, ts, uid, orig_h, orig_p, resp_h, resp_p, version
+    [v6] 현재 zeek_http 이벤트 실측 필드: source, ts, uid, orig_h, orig_p, resp_h, resp_p, version
          method/host/uri/user_agent 등 세부 HTTP 필드는 Spark zeek.py 에 미포함.
          ev.get() 으로 읽어두어 추후 Spark 확장 시 자동 수용.
     """
@@ -400,6 +400,7 @@ def _extract_http(timeline: list[dict]) -> dict:
         "http_method", "http_host", "http_uri", "http_user_agent",
         "http_request_body_len", "http_response_body_len",
         "http_status_code", "http_status_msg",
+        "http_version",                          # [v7] 추가
     ]}
     for ev in timeline:
         if ev.get("source") != "zeek_http":
@@ -416,6 +417,7 @@ def _extract_http(timeline: list[dict]) -> dict:
             "http_response_body_len": ev.get("response_body_len"),
             "http_status_code":       ev.get("status_code"),
             "http_status_msg":        ev.get("status_msg"),
+            "http_version":           ev.get("version"),  # [v7] zeek_http version 필드
         }
     return _null
 
@@ -438,7 +440,7 @@ def _extract_dns(timeline: list[dict]) -> dict:
 
 def _extract_ssl(timeline: list[dict]) -> dict:
     """
-      zeek_ssl timeline 실측 필드명:
+    [v6] zeek_ssl timeline 실측 필드명:
          version, curve, established, ssl_history, resumed, cipher, server_name
     """
     _null = {k: None for k in [
@@ -461,7 +463,7 @@ def _extract_ssl(timeline: list[dict]) -> dict:
 
 def _extract_suricata_stats(row: dict, timeline: list[dict]) -> dict:
     """
-     
+    [v6]
     · alert_count: top-level 값 1순위 (Spark build_suricata_flows 집계 확정값)
     · threat_level → max_severity: top-level 값 1순위
       (Spark: spark_max(severity), 낮을수록 심각이므로 실제론 max가 덜 심각하지만 원본 유지)
@@ -644,10 +646,10 @@ def extract_entities(**ctx) -> None:
                 _update_ip(ev.get("resp_h"), ts, sid, 0, int(ev.get("resp_bytes") or 0))
 
             elif source == "suricata":
-                #   suricata: src_ip/dest_ip 직접 사용 (orig_h/resp_h 없음)
+                # [v6] suricata: src_ip/dest_ip 직접 사용 (orig_h/resp_h 없음)
                 _update_ip(ev.get("src_ip"),  ts, sid)
                 _update_ip(ev.get("dest_ip"), ts, sid)
-                #   event_type=="alert" 인 것만 alert_bucket 에 추가
+                # [v6] event_type=="alert" 인 것만 alert_bucket 에 추가
                 if ev.get("event_type") == "alert" and ev.get("signature"):
                     _update_alert(
                         ev.get("signature_id"), ev.get("signature"),
@@ -788,7 +790,7 @@ def extract_relations(**ctx) -> None:
                     _add("session", sid, "ENCRYPTED_WITH",  "cipher", ev["cipher"],      sid)
 
             elif source == "suricata" and ev.get("event_type") == "alert" and ev.get("signature"):
-                #   event_type=="alert" 인 것만 TRIGGERED 관계 생성
+                # [v6] event_type=="alert" 인 것만 TRIGGERED 관계 생성
                 _add(
                     "session", sid, "TRIGGERED", "alert",
                     str(ev.get("signature_id") or ev.get("signature")), sid,
@@ -826,7 +828,7 @@ def report_stats(**ctx) -> None:
     uid_count    = sum(1 for s in sessions if s.get("uid"))
 
     logger.info("=" * 65)
-    logger.info("▶ Gold 전처리 파이프라인 완료 요약 (v6 — Spark silver 대응)")
+    logger.info("▶ Gold 전처리 파이프라인 완료 요약 (v7 — Spark silver 대응)")
     logger.info("=" * 65)
     logger.info("  [Input]  silver/common_records (parquet) : %s 레코드", total_lines)
     logger.info(
