@@ -686,17 +686,20 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     tags=["cti", "graph-rag", "preprocessing"],
+    
 ) as dag:
-
     wait_for_sqs = SqsSensor(
         task_id="wait_for_sqs",
         sqs_queue=SQS_QUEUE_URL,
         aws_conn_id="aws_default",
-        max_messages=1,
-        wait_time_seconds=20,
-        visibility_timeout=300,
-        delete_message_on_reception=False,
         deferrable=True,
+        wait_time_seconds=20,
+        num_batches=1,
+        max_messages=5,
+        message_filtering="jsonpath-ext",
+        message_filtering_config="Records[?@.s3.object.key]",
+        delete_message_on_reception=True,
+         message_filtering_match_values={"*_SUCCESS"},
     )
 
     parsed_event = parse_s3_event(wait_for_sqs.output)
