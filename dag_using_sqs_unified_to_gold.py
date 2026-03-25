@@ -44,8 +44,8 @@ logger = logging.getLogger(__name__)
 
 # ── 공통 S3 헬퍼 ──────────────────────────────────────────────────────────────
 
-@task(task_id="parse_done_event")
-def parse_done_event(messages):
+@task(task_id="parse_s3_event")
+def parse_s3_event(messages):
     if not messages:
         return {"skip": True, "reason": "empty_messages"}
 
