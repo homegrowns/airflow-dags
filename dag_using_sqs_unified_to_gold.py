@@ -94,6 +94,50 @@ def parse_s3_event(messages):
         "items": done_files,
     }
 
+
+
+
+# ── Task 0-1 : fetch_from_s3 ──────────────────────────────────────────────────
+
+@task(task_id="fetch_from_s3", multiple_outputs=True)
+def fetch_from_s3(event: dict | None = None) -> dict:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # SQS 이벤트가 있고, 스킵 사유가 있으면 바로 종료
+    if event and event.get("skip"):
+        logger.info("SQS 이벤트 스킵 사유=%s", event.get("reason"))
+        return {
+            "skip": True,
+            "parquet_keys": [],
+        }
+
+    keys = _list_silver_parquet_keys()
+    if not keys:
+        logger.warning("silver prefix 에 parquet 파일 없음 — 처리 스킵")
+        return {
+            "skip": True,
+            "parquet_keys": [],
+        }
+
+    latest_modified = _latest_silver_modified(keys)
+
+    if LAST_MODIFIED_PATH.exists():
+        if LAST_MODIFIED_PATH.read_text().strip() == latest_modified:
+            logger.info("silver 데이터 변경 없음 (LastModified=%s) — 처리 스킵", latest_modified)
+            return {
+                "skip": True,
+                "parquet_keys": [],
+            }
+
+    LAST_MODIFIED_PATH.write_text(latest_modified)
+    logger.info("silver 데이터 변경 감지 (LastModified=%s, 파일 수=%d)", latest_modified, len(keys))
+
+    return {
+        "skip": False,
+        "parquet_keys": keys,
+    }
+
+
 # ── 공통 유틸 ─────────────────────────────────────────────────────────────────
 
 def _make_session_id(community_id: str | None, idx: int) -> str:
