@@ -44,96 +44,55 @@ logger = logging.getLogger(__name__)
 
 # ── 공통 S3 헬퍼 ──────────────────────────────────────────────────────────────
 
-@task(task_id="parse_s3_event")
-def parse_s3_event(messages):
+@task(task_id="parse_done_event")
+def parse_done_event(messages):
     if not messages:
         return {"skip": True, "reason": "empty_messages"}
 
-    body = json.loads(messages[0]["Body"])
+    done_files = []
 
-    if body.get("Event") == "s3:TestEvent":
-        return {"skip": True, "reason": "s3_test_event"}
+    for message in messages:
+        body = json.loads(message["Body"])
 
-    records = body.get("Records", [])
-    if not records:
-        return {"skip": True, "reason": "no_records"}
-
-    valid_records = []
-
-    for record in records:
-        bucket = record["s3"]["bucket"]["name"]
-        raw_key = record["s3"]["object"]["key"]
-        key = unquote_plus(raw_key)
-        event_name = record.get("eventName")
-
-        if not key.startswith("silver/common_records/"):
+        if body.get("Event") == "s3:TestEvent":
             continue
 
-        if "/_temporary/" in key or key.startswith("_temporary/"):
-            continue
+        for record in body.get("Records", []):
+            event_name = record.get("eventName")
+            bucket = record["s3"]["bucket"]["name"]
+            key = unquote_plus(record["s3"]["object"]["key"])
 
-        if key.endswith("/_SUCCESS") or key.endswith("_SUCCESS"):
-            continue
+            if not event_name or not event_name.startswith("ObjectCreated:"):
+                continue
 
-        if "/rejected_records/" in key or key.startswith("rejected_records/"):
-            continue
+            if not key.startswith("signals/common_records_ready/"):
+                continue
 
-        if not key.endswith(".parquet"):
-            continue
+            if not key.endswith(".done"):
+                continue
 
-        valid_records.append({
-            "bucket": bucket,
-            "key": key,
-            "event_name": event_name,
-        })
+            m = re.search(r"dt=([^/]+)/hour=([^/]+)/batch_seq=([^.]+)\.done$", key)
+            if not m:
+                continue
 
-    if not valid_records:
-        return {"skip": True, "reason": "no_valid_records"}
+            dt, hour, batch_seq = m.groups()
+
+            done_files.append({
+                "bucket": bucket,
+                "done_key": key,
+                "dt": dt,
+                "hour": hour,
+                "batch_seq": batch_seq,
+                "common_prefix": f"silver/common_records/dt={dt}/hour={hour}/batch_seq={batch_seq}/",
+            })
+
+    if not done_files:
+        return {"skip": True, "reason": "no_valid_done_files"}
 
     return {
         "skip": False,
-        "records": valid_records,
+        "items": done_files,
     }
-# ── Task 0-1 : fetch_from_s3 ──────────────────────────────────────────────────
-
-@task(task_id="fetch_from_s3", multiple_outputs=True)
-def fetch_from_s3(event: dict | None = None) -> dict:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    # SQS 이벤트가 있고, 스킵 사유가 있으면 바로 종료
-    if event and event.get("skip"):
-        logger.info("SQS 이벤트 스킵 사유=%s", event.get("reason"))
-        return {
-            "skip": True,
-            "parquet_keys": [],
-        }
-
-    keys = _list_silver_parquet_keys()
-    if not keys:
-        logger.warning("silver prefix 에 parquet 파일 없음 — 처리 스킵")
-        return {
-            "skip": True,
-            "parquet_keys": [],
-        }
-
-    latest_modified = _latest_silver_modified(keys)
-
-    if LAST_MODIFIED_PATH.exists():
-        if LAST_MODIFIED_PATH.read_text().strip() == latest_modified:
-            logger.info("silver 데이터 변경 없음 (LastModified=%s) — 처리 스킵", latest_modified)
-            return {
-                "skip": True,
-                "parquet_keys": [],
-            }
-
-    LAST_MODIFIED_PATH.write_text(latest_modified)
-    logger.info("silver 데이터 변경 감지 (LastModified=%s, 파일 수=%d)", latest_modified, len(keys))
-
-    return {
-        "skip": False,
-        "parquet_keys": keys,
-    }
-
 
 # ── 공통 유틸 ─────────────────────────────────────────────────────────────────
 
@@ -696,10 +655,7 @@ with DAG(
         wait_time_seconds=20,
         num_batches=1,
         max_messages=5,
-        message_filtering="jsonpath-ext",
-        message_filtering_config="Records[?@.s3.object.key]",
         delete_message_on_reception=True,
-        message_filtering_match_values={"*_SUCCESS"},
     )
 
     parsed_event = parse_s3_event(wait_for_sqs.output)
