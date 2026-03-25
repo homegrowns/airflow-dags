@@ -2,6 +2,14 @@
 dag_unified_to_gold.py
 S3 silver/common_records (Spark 파티션 parquet) → session_gold / entity_gold / relation_gold
 
+[v7 변경점]
+  - parquet_to_jsonl task 제거
+  - S3_JSONL_KEY / unified_events.jsonl 중간 파일 완전 제거
+  - _load_silver_records() 공통 헬퍼로 parquet 로딩·통합 로직 분리
+    · validate_input / extract_sessions / extract_entities / extract_relations
+      모두 이 헬퍼를 직접 호출해 parquet → list[dict] 로드
+  - fetch_from_s3 가 parquet_keys XCom 을 push → 이후 task 재사용
+
 [v6 변경점 — Spark silver 실제 출력 스키마 대응]
 
   ※ Spark build_common_records() 실제 출력 컬럼
@@ -57,19 +65,17 @@ S3 silver/common_records (Spark 파티션 parquet) → session_gold / entity_gol
        · suricata TRIGGERED: event_type=="alert" 인 것만 생성
 
 Pipeline:
-  [fetch_from_s3]      ← silver prefix LastModified 체크 → skip XCom
+  [fetch_from_s3]    ← silver prefix LastModified 체크 → skip / parquet_keys XCom
        ↓
-  [parquet_to_jsonl]   ← silver parquet 전체 읽기 → community_id 통합 → JSONL → S3
+  [validate_input]   ← parquet 직접 로드 → 레코드 수 검증
        ↓
-  [validate_input]     ← JSONL 행 수 검증
+  [extract_sessions] ← parquet 직접 로드 → session_gold → S3
        ↓
-  [extract_sessions]   ← session_gold → S3
+  [extract_entities] ← parquet 직접 로드 + session_gold → entity_gold → S3
        ↓
-  [extract_entities]   ← entity_gold → S3
+  [extract_relations]← parquet 직접 로드 + session_gold → relation_gold → S3
        ↓
-  [extract_relations]  ← relation_gold → S3
-       ↓
-  [report_stats]       ← 요약 통계 로그
+  [report_stats]     ← 요약 통계 로그
 
 Author : Linda
 """
@@ -94,10 +100,9 @@ from airflow.sdk import Asset
 # ── S3 설정 ───────────────────────────────────────────────────────────────────
 S3_BUCKET = "malware-project-bucket"
 
-# [v6] Spark silver 파티션 parquet prefix
+# Spark silver 파티션 parquet prefix
 S3_SILVER_PREFIX = "silver/common_records/"
 
-S3_JSONL_KEY    = "unified_events.jsonl"
 S3_SESSION_KEY  = "gold/session_gold.jsonl"
 S3_ENTITY_KEY   = "gold/entity_gold.jsonl"
 S3_RELATION_KEY = "gold/relation_gold.jsonl"
@@ -201,33 +206,24 @@ def fetch_from_s3(**ctx) -> None:
     ctx["ti"].xcom_push(key="parquet_keys", value=keys)
 
 
-# ── Task 0-2 : parquet_to_jsonl ───────────────────────────────────────────────
+# ── [v7] silver parquet 로딩 공통 헬퍼 ───────────────────────────────────────
 
-def parquet_to_jsonl(**ctx) -> None:
+def _load_silver_records(ctx) -> list[dict]:
     """
-    [v6] Spark silver parquet 전체 읽기 → community_id 기준 통합 → JSONL.
+    silver/common_records/ prefix 내 parquet 전체 읽기 →
+    community_id 기준 통합 → list[dict] 반환.
 
-    핵심 처리:
-    · 파티션 컬럼(dt/hour/batch_seq) 제거
-    · flow_start/flow_end Unix ms int → ISO UTC 변환
-    · timeline JSON string → list 파싱
-    · 동일 community_id 가 여러 배치에 존재할 경우
-      timeline 누적, 수치 필드는 최신 배치 값 우선
+    parquet_to_jsonl task 를 제거하면서 validate_input / extract_sessions /
+    extract_entities / extract_relations 가 직접 호출하는 공통 헬퍼.
     """
     import pandas as pd
-    import numpy as np
 
-    ti = ctx["ti"]
-    if ti.xcom_pull(task_ids="fetch_from_s3", key="skip"):
-        logger.info("silver 변경 없음 — parquet 변환 스킵")
-        return
-
+    ti   = ctx["ti"]
     keys: list[str] = ti.xcom_pull(task_ids="fetch_from_s3", key="parquet_keys") or []
     if not keys:
-        keys = _list_silver_parquet_keys()  # fetch 재실행 대비
+        keys = _list_silver_parquet_keys()
 
     s3 = _s3_client()
-
     frames: list[pd.DataFrame] = []
     for key in keys:
         try:
@@ -240,20 +236,15 @@ def parquet_to_jsonl(**ctx) -> None:
         raise ValueError("읽을 수 있는 silver parquet 파일이 없습니다.")
 
     df = pd.concat(frames, ignore_index=True)
-    logger.info("silver 로드 완료 — %d 행 / 컬럼: %s", len(df), list(df.columns))
-
-    # 파티션 컬럼 제거
     df = df.drop(columns=[c for c in ("dt", "hour", "batch_seq") if c in df.columns])
-
-    # flow_start 기준 오름차순 정렬 (배치 통합 시 최신값을 나중에 덮어씀)
     if "flow_start" in df.columns:
         df = df.sort_values("flow_start", na_position="last")
 
     def _convert(v: Any) -> Any:
         if isinstance(v, float) and v != v: return None
-        if isinstance(v, bool):             return v        # bool 먼저 (np.bool_ 상속)
+        if isinstance(v, bool):             return v
         if isinstance(v, (int, str)):       return v
-        if hasattr(v, "item"):              return v.item() # np.integer / np.floating
+        if hasattr(v, "item"):              return v.item()
         if isinstance(v, list):             return v
         return v
 
@@ -267,18 +258,14 @@ def parquet_to_jsonl(**ctx) -> None:
 
     for _, row in df.iterrows():
         record: dict[str, Any] = {k: _convert(v) for k, v in row.to_dict().items()}
-
-        # flow_start / flow_end Unix ms → ISO UTC
         record["flow_start"] = _ms_to_iso(record.get("flow_start"))
         record["flow_end"]   = _ms_to_iso(record.get("flow_end"))
 
-        # timeline JSON string → list
         tl_raw = record.get("timeline", [])
         if isinstance(tl_raw, str):
             try:
                 tl_parsed = json.loads(tl_raw)
-                if not isinstance(tl_parsed, list):
-                    tl_parsed = []
+                if not isinstance(tl_parsed, list): tl_parsed = []
             except json.JSONDecodeError:
                 tl_parsed = []
         elif isinstance(tl_raw, list):
@@ -297,29 +284,20 @@ def parquet_to_jsonl(**ctx) -> None:
             merged[cid] = record
         else:
             ex = merged[cid]
-            # timeline 누적
             ex["timeline"] = ex.get("timeline", []) + tl_parsed
-            # 수치/식별 필드: 새 값이 None 이 아닐 때만 덮어씀
             for f in NUMERIC_FIELDS:
                 if record.get(f) is not None:
                     ex[f] = record[f]
-            # flow_start: 더 이른 값 유지
             fs_old, fs_new = ex.get("flow_start"), record.get("flow_start")
-            if fs_old and fs_new:
-                ex["flow_start"] = min(fs_old, fs_new)
-            elif fs_new:
-                ex["flow_start"] = fs_new
-            # flow_end: 더 늦은 값 유지
+            if fs_old and fs_new: ex["flow_start"] = min(fs_old, fs_new)
+            elif fs_new:          ex["flow_start"] = fs_new
             fe_old, fe_new = ex.get("flow_end"), record.get("flow_end")
-            if fe_old and fe_new:
-                ex["flow_end"] = max(fe_old, fe_new)
-            elif fe_new:
-                ex["flow_end"] = fe_new
+            if fe_old and fe_new: ex["flow_end"] = max(fe_old, fe_new)
+            elif fe_new:          ex["flow_end"] = fe_new
 
     records = list(merged.values())
-    _s3_write_jsonl(S3_JSONL_KEY, records)
-    logger.info("parquet_to_jsonl 완료 — community_id 기준 %d 레코드", len(records))
-    ctx["ti"].xcom_push(key="jsonl_rows", value=len(records))
+    logger.info("_load_silver_records 완료 — community_id 기준 %d 레코드", len(records))
+    return records
 
 
 # ── 공통 유틸 ─────────────────────────────────────────────────────────────────
@@ -340,13 +318,12 @@ def validate_input(**ctx) -> None:
     if ctx["ti"].xcom_pull(task_ids="fetch_from_s3", key="skip"):
         logger.info("silver 변경 없음 — validate 스킵")
         return
-    s3  = _s3_client()
-    obj = s3.get_object(Bucket=S3_BUCKET, Key=S3_JSONL_KEY)
-    line_count = sum(1 for line in obj["Body"].iter_lines() if line.strip())
-    if line_count == 0:
-        raise ValueError("unified_events.jsonl 가 비어 있습니다.")
-    logger.info("validate_input OK — 총 %d 행", line_count)
-    ctx["ti"].xcom_push(key="total_lines", value=line_count)
+    records    = _load_silver_records(ctx)
+    record_count = len(records)
+    if record_count == 0:
+        raise ValueError("silver parquet 에서 읽은 레코드가 없습니다.")
+    logger.info("validate_input OK — 총 %d 레코드", record_count)
+    ctx["ti"].xcom_push(key="total_lines", value=record_count)
 
 
 # ── Task 2 : extract_sessions ─────────────────────────────────────────────────
@@ -529,7 +506,7 @@ def extract_sessions(**ctx) -> None:
         logger.info("silver 변경 없음 — extract_sessions 스킵")
         return
 
-    raw_sessions = _s3_read_jsonl(S3_JSONL_KEY)
+    raw_sessions = _load_silver_records(ctx)
     seen_cids:  dict[str, str] = {}
     orphan_idx = 0
     records:    list[dict]     = []
@@ -600,7 +577,7 @@ def extract_entities(**ctx) -> None:
         return
 
     sessions = _s3_read_jsonl(S3_SESSION_KEY)
-    raw      = _s3_read_jsonl(S3_JSONL_KEY)
+    raw      = _load_silver_records(ctx)
 
     ip_bucket:     dict[str, dict] = {}
     domain_bucket: dict[str, dict] = {}
@@ -735,7 +712,7 @@ def extract_relations(**ctx) -> None:
         return
 
     sessions   = _s3_read_jsonl(S3_SESSION_KEY)
-    raw        = _s3_read_jsonl(S3_JSONL_KEY)
+    raw        = _load_silver_records(ctx)
     cid_to_sid = {s["community_id"]: s["session_id"] for s in sessions if s.get("community_id")}
 
     seen:    set[tuple] = set()
@@ -879,7 +856,7 @@ default_args = {
 
 with DAG(
     dag_id="unified_events_to_gold",
-    description="Spark silver parquet → session/entity/relation gold 전처리 v6",
+    description="Spark silver parquet → session/entity/relation gold 전처리 v7",
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
     schedule="*/10 * * * *",
@@ -889,7 +866,6 @@ with DAG(
 ) as dag:
 
     t_fetch    = PythonOperator(task_id="fetch_from_s3",    python_callable=fetch_from_s3)
-    t_convert  = PythonOperator(task_id="parquet_to_jsonl", python_callable=parquet_to_jsonl)
     t_validate = PythonOperator(task_id="validate_input",   python_callable=validate_input)
     t_sessions = PythonOperator(task_id="extract_sessions", python_callable=extract_sessions)
     t_entities = PythonOperator(task_id="extract_entities", python_callable=extract_entities)
@@ -900,4 +876,4 @@ with DAG(
         outlets=[GOLD_SESSION_ASSET, GOLD_ENTITY_ASSET, GOLD_RELATION_ASSET],
     )
 
-    t_fetch >> t_convert >> t_validate >> t_sessions >> t_entities >> t_relations >> t_report
+    t_fetch >> t_validate >> t_sessions >> t_entities >> t_relations >> t_report
