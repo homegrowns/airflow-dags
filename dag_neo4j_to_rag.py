@@ -842,6 +842,8 @@ Analyze and respond ONLY in this JSON format (no markdown, no explanation):
 
 
 def run_rag_analysis(**ctx) -> None:
+    from groq import RateLimitError
+
     subgraphs: list[dict] = ctx["ti"].xcom_pull(
         task_ids="build_subgraphs", key="subgraphs"
     ) or []
@@ -859,26 +861,19 @@ def run_rag_analysis(**ctx) -> None:
         session_id = sg["session"].get("session_id", f"unknown_{i}")
         user_text  = _subgraph_to_text(sg)
 
-        try:
-            response = groq.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user",   "content": user_text},
-                ],
-                temperature=0.1,
-                max_tokens=1024,
-            )
-            raw = response.choices[0].message.content.strip()
+        def _parse_response(raw: str) -> dict:
             try:
-                analysis = json.loads(raw)
+                return json.loads(raw)
             except json.JSONDecodeError:
                 cleaned = raw.replace("```json", "").replace("```", "").strip()
                 try:
-                    analysis = json.loads(cleaned)
+                    return json.loads(cleaned)
                 except json.JSONDecodeError:
-                    analysis = {"raw_response": raw, "parse_error": True}
+                    return {"raw_response": raw, "parse_error": True}
 
+        def _append_result(response) -> None:
+            raw      = response.choices[0].message.content.strip()
+            analysis = _parse_response(raw)
             results.append({
                 "session_id": session_id,
                 "uid":        sg["session"].get("uid"),
@@ -890,6 +885,46 @@ def run_rag_analysis(**ctx) -> None:
                 "neighbors": sg.get("neighbors", []),
             })
 
+        try:
+            response = groq.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user",   "content": user_text},
+                ],
+                temperature=0.1,
+                max_tokens=1024,
+            )
+            _append_result(response)
+
+        except RateLimitError as e:
+            logger.warning(
+                "run_rag_analysis: session_id=%s Rate Limit — 60초 대기 후 8b로 재시도", session_id
+            )
+            time.sleep(60)
+            try:
+                response = groq.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=[
+                        {"role": "system", "content": _SYSTEM_PROMPT},
+                        {"role": "user",   "content": user_text},
+                    ],
+                    temperature=0.1,
+                    max_tokens=1024,
+                )
+                _append_result(response)
+            except Exception as e2:
+                logger.error(
+                    "run_rag_analysis: session_id=%s fallback 실패 — %s", session_id, e2
+                )
+                results.append({
+                    "session_id": session_id,
+                    "uid":        sg["session"].get("uid"),
+                    "session":    sg["session"],
+                    "analysis":   {"error": str(e2)},
+                    "neighbors":  sg.get("neighbors", []),
+                })
+
         except Exception as e:
             logger.error("run_rag_analysis: session_id=%s 오류 — %s", session_id, e)
             results.append({
@@ -897,15 +932,14 @@ def run_rag_analysis(**ctx) -> None:
                 "uid":        sg["session"].get("uid"),
                 "session":    sg["session"],
                 "analysis":   {"error": str(e)},
-                "neighbors": sg.get("neighbors", []),
+                "neighbors":  sg.get("neighbors", []),
             })
 
         time.sleep(GROQ_RPM_SLEEP)
 
     logger.info("run_rag_analysis: %d 건 분석 완료", len(results))
     ctx["ti"].xcom_push(key="rag_results", value=results)
-
-
+    
 # ══════════════════════════════════════════════════════════════════════════════
 # Task 6 : save_rag_results
 # ══════════════════════════════════════════════════════════════════════════════
