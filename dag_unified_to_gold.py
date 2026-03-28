@@ -76,9 +76,14 @@ def _gold_s3_key(table: str, execution_date: datetime) -> str:
     silver 파티션 경로 기준에 맞춘 gold parquet 경로.
     예) gold/session_gold/dt=2026-03-27/hour=20/minute_10=20/minute_10=20_session_gold.parquet
     """
-    dt        = execution_date.strftime("%Y-%m-%d")
-    hour      = execution_date.strftime("%H")
-    minute_10 = f"{(execution_date.minute // 10) * 10:02d}"
+    # ── UTC → KST 변환 ────────────────────────────────────────────────────────
+    if execution_date.tzinfo is None:
+        execution_date = execution_date.replace(tzinfo=timezone.utc)
+    execution_date_kst = execution_date.astimezone(KST)
+
+    dt        = execution_date_kst.strftime("%Y-%m-%d")
+    hour      = execution_date_kst.strftime("%H")
+    minute_10 = f"{(execution_date_kst.minute // 10) * 10:02d}"
     return (
         f"{S3_GOLD_PREFIX}/{table}"
         f"/dt={dt}/hour={hour}/minute_10={minute_10}"
@@ -91,9 +96,14 @@ def _silver_sensor_prefix(execution_date: datetime) -> str:
     S3KeysUnchangedSensor 가 감시할 silver prefix.
     DAG 실행 시각 기준 dt/hour/minute_10 으로 결정.
     """
-    dt        = execution_date.strftime("%Y-%m-%d")
-    hour      = execution_date.strftime("%H")
-    minute_10 = f"{(execution_date.minute // 10) * 10:02d}"
+    # ── UTC → KST 변환 ────────────────────────────────────────────────────────
+    if execution_date.tzinfo is None:
+        execution_date = execution_date.replace(tzinfo=timezone.utc)
+    execution_date_kst = execution_date.astimezone(KST)
+
+    dt        = execution_date_kst.strftime("%Y-%m-%d")
+    hour      = execution_date_kst.strftime("%H")
+    minute_10 = f"{(execution_date_kst.minute // 10) * 10:02d}"
     return f"{S3_SILVER_PREFIX}dt={dt}/hour={hour}/minute_10={minute_10}/"
 
 
