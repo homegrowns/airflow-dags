@@ -167,7 +167,8 @@ def _build_rag_s3_key(partition: dict[str, str]) -> str:
     minute = int(partition["minute"])
     return (
         f"{S3_RAG_PREFIX}/"
-        f"dt={dt}_hour={hour:02d}_minute={minute:02d}_rag_results.jsonl"
+        f"dt={dt}/"
+        f"hour={hour:02d}_minute={minute:02d}_rag_results.jsonl"
     )
 
 
@@ -609,6 +610,12 @@ You will be given:
 1. Current session attributes (from real-time network logs)
 2. Past behavior context from Neo4j graph (may be empty for brand-new sessions)
 
+LANGUAGE RULES (STRICT):
+- summary, recommended_action 은 반드시 한국어로만 작성할 것
+- 중국어, 일본어, 영어 등 다른 언어 절대 사용 금지
+- 문체는 반드시 "~임.", "~됨.", "~필요." 형태의 간결한 개조식 종결어미 사용
+- 존댓말("~합니다", "~입니다") 및 반말("~다", "~함") 혼용 금지
+
 When writing the summary, you MUST analyze and reference ALL of the following fields if present:
 - community_id         : 동일 community_id의 반복 등장 여부 (세션 군집 이상 여부)
 - src_ip / dest_ip     : 출발지·목적지 IP (내부망 여부, 알려진 악성 IP 패턴)
@@ -625,7 +632,7 @@ When writing the summary, you MUST analyze and reference ALL of the following fi
 Analyze and respond ONLY in this JSON format (no markdown, no explanation):
 {
   "threat_type": "<Web Application Attack | A Network Trojan was detected | Misc Attack | Potentially Bad Traffic | Detection of a Network Scan | Not Suspicious Traffic | Attempted Administrator Privilege Gain | Attempted User Privilege Gain | Generic Protocol Command Decode | Malware Command and Control Activity Detected | Unknown Traffic>",
-  "summary": "<2~3문장 한국어 위협 요약. 위 필드 중 실제로 존재하는 값을 구체적으로 인용하여 판단 근거를 서술할 것. N/A이거나 없는 필드는 언급하지 말 것>",
+  "summary": "<2~3문장 한국어 위협 요약. 반드시 개조식(~임. ~됨. ~필요.) 한국어로만 작성. 위 필드 중 실제로 존재하는 값을 구체적으로 인용하여 판단 근거를 서술할 것. N/A이거나 없는 필드는 언급하지 말 것>",
   "recommended_action": "<한 줄 대응 권고>"
 }
 """
