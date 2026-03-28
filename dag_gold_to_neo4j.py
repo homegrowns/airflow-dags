@@ -1,12 +1,12 @@
 """
 dag_gold_to_neo4j.py
-Gold parquet (S3) → Neo4j 그래프 적재 DAG (v6 — parquet 전환 / session_key XCom 연동)
+Gold parquet (S3) → Neo4j 그래프 적재 DAG (v7 — run_id 기반 XCom / max_active_runs=4)
 
-- 입력 형식: JSONL → parquet
-- unified_events_to_gold.extract_sessions XCom(session_key) 수신
-→ session / entity / relation parquet 경로 동적 결정 (_sibling_key)
-- load_sessions: session_gold prefix → neo4j_to_rag XCom 전달
-- 전체 ts → KST 변환
+[v7 변경점]
+  - max_active_runs: 1 → 4 (unified_events_to_gold 동시 실행 대응)
+  - load_sessions XCom 조회: include_prior_dates → run_id 기반
+    · consumed_asset_events.source_run_id 로 어떤 unified run이 트리거했는지 추적
+    · 정확한 배치의 session_key 조회 보장
 
 Pipeline:
   [clear_graph]    ← CLEAR_GRAPH_ENABLED=true 일 때만 Neo4j 전체 초기화
@@ -20,6 +20,8 @@ Pipeline:
   [create_indexes] ← 인덱스 / 제약 조건 생성 (멱등)
        ↓
   [report_stats]   ← Neo4j 카운트 로그
+
+Author : Linda
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from zoneinfo import ZoneInfo
 import boto3
 from airflow import DAG
 from airflow.models import Variable
+from airflow.models.xcom import XCom
 from airflow.operators.python import PythonOperator
 from airflow.sdk import Asset
 
@@ -83,12 +86,10 @@ def _run_batches(session, query: str, records: list[dict], batch_size: int = BAT
 
 
 def _sibling_key(session_key: str, table: str) -> str:
-    """session_key 경로에서 테이블명만 교체."""
     return session_key.replace("session_gold", table)
 
 
 def _prefix_from_key(s3_key: str) -> str:
-    """parquet 경로 → 디렉터리 prefix."""
     return s3_key.rsplit("/", 1)[0] + "/"
 
 
@@ -113,6 +114,24 @@ def _to_kst_iso(ts: Any) -> str | None:
         return datetime.fromtimestamp(v, tz=timezone.utc).astimezone(KST).isoformat()
     except Exception:
         return str(ts)
+
+
+def _get_source_run_id(ctx) -> str | None:
+    """
+    Asset 트리거한 unified_events_to_gold 의 run_id 추출.
+    consumed_asset_events 에서 session_gold Asset 을 emit 한 run_id 반환.
+    """
+    try:
+        events = ctx["dag_run"].consumed_asset_events or []
+        for event in events:
+            if "session_gold" in str(getattr(event, "asset_uri", "")):
+                return event.source_run_id
+        # fallback: 첫 번째 이벤트 run_id
+        if events:
+            return events[0].source_run_id
+    except Exception as e:
+        logger.warning("_get_source_run_id: consumed_asset_events 조회 실패 — %s", e)
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -197,13 +216,21 @@ SET
 """
 
 def load_sessions(**ctx) -> None:
-    session_key: str = ctx["ti"].xcom_pull(
-        dag_id="unified_events_to_gold",
-        task_ids="extract_sessions",
+    # ── Asset 트리거한 unified run_id 기반으로 session_key XCom 조회 ──────────
+    source_run_id = _get_source_run_id(ctx)
+    logger.info("load_sessions: source_run_id = %s", source_run_id)
+
+    session_key = XCom.get_one(
         key="session_key",
+        dag_id="unified_events_to_gold",
+        task_id="extract_sessions",
+        run_id=source_run_id,           # 해당 배치 run의 XCom만 조회
     )
+
     if not session_key:
-        raise ValueError("load_sessions: session_key XCom 없음")
+        raise ValueError(
+            f"load_sessions: session_key XCom 없음 (source_run_id={source_run_id})"
+        )
     logger.info("load_sessions: session_key = %s", session_key)
 
     records = _s3_read_parquet(session_key)
@@ -425,7 +452,7 @@ def report_stats(**ctx) -> None:
     driver.close()
 
     logger.info("=" * 70)
-    logger.info("▶ gold_to_neo4j 파이프라인 완료 요약 (v6 — parquet 전환)")
+    logger.info("▶ gold_to_neo4j 파이프라인 완료 요약 (v7)")
     logger.info("=" * 70)
     logger.info("  [소스]  session_gold parquet   : s3://%s/%s", S3_BUCKET, session_key)
     logger.info("  [적재]  session:%s  entity:%s  relation:%s",
@@ -459,12 +486,12 @@ default_args = {
 
 with DAG(
     dag_id="gold_to_neo4j",
-    description="Gold parquet (S3) → Neo4j 그래프 적재 v6 (parquet 전환 / XCom 연동)",
+    description="Gold parquet (S3) → Neo4j 그래프 적재 v7 (run_id XCom / max_active_runs=4)",
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
     schedule=[GOLD_SESSION_ASSET, GOLD_ENTITY_ASSET, GOLD_RELATION_ASSET],
     catchup=False,
-    max_active_runs=1,
+    max_active_runs=5,    # unified_events_to_gold 동시 실행 수와 맞춤
     tags=["cti", "graph-rag", "neo4j"],
 ) as dag:
 

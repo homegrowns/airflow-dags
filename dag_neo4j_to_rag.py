@@ -2,20 +2,17 @@
 dag_neo4j_to_rag.py
 실시간 추론 DAG — session_gold parquet (S3) → whitelist → Neo4j enrichment → Groq RAG
 
-- 트리거 방식:
-· unified_events_to_gold._s3_write_parquet() 이 생성한 _SUCCESS 마커 감지
-· 15초 폴링으로 즉시성 확보
-- resolve_session_gold_prefix task 추가
-· 최신 _SUCCESS 경로에서 prefix / partition 파싱
-· load_session_gold 가 해당 배치만 읽도록 보장
-- 입력 소스: silver parquet → session_gold parquet
-- inference_datetime 컬럼 추가 (KST)
-- 모든 ts → KST 변환
+[v7 변경점]
+  - max_active_runs: 1 → 4 (unified_events_to_gold 동시 실행 대응)
+  - schedule=None: TriggerDagRunOperator 전용 (자체 스케줄 없음)
+  - resolve_session_gold_prefix: conf에서 session_key 직접 수신
+    · conf["session_key"]: 정확한 parquet 경로
+    · conf["source_run_id"]: 트리거한 unified run_id (로깅용)
+  - 모든 ts → KST 변환
+  - inference_datetime: DAG 실행 시각 KST
 
 Pipeline:
-  [wait_for_session_gold]       ← S3KeySensor: _SUCCESS 감지 (15초 폴링)
-          ↓
-  [resolve_session_gold_prefix] ← 최신 _SUCCESS → prefix / partition 파싱
+  [resolve_session_gold_prefix] ← conf에서 session_key / source_run_id 수신
           ↓
   [load_session_gold]           ← 해당 배치 parquet만 읽기
           ↓
@@ -28,6 +25,8 @@ Pipeline:
   [save_rag_results]            ← S3 저장 (gold partition 기반 경로)
           ↓
   [report_rag_stats]            ← 통계 로그
+
+Author : Linda
 """
 
 from __future__ import annotations
@@ -46,7 +45,6 @@ import boto3
 from airflow import DAG
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator
-# from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
 
 logger = logging.getLogger(__name__)
 
@@ -137,12 +135,12 @@ def _list_session_gold_keys(prefix: str) -> list[str]:
 
 def _parse_gold_partition(prefix: str) -> dict[str, str]:
     """
-    gold/session_gold/dt=2026-03-28/hour=14/minute_10=10/
-    → {"dt": "2026-03-28", "hour": "14", "minute": "10"}
+    gold/session_gold/dt=2026-03-29/hour=01/minute_10=50/
+    → {"dt": "2026-03-29", "hour": "01", "minute": "50"}
     """
-    dt_m     = re.search(r"dt=([^/]+)",            prefix)
-    hour_m   = re.search(r"hour=(\d+)",             prefix)
-    minute_m = re.search(r"minute(?:_10)?=(\d+)",   prefix)
+    dt_m     = re.search(r"dt=([^/]+)",          prefix)
+    hour_m   = re.search(r"hour=(\d+)",           prefix)
+    minute_m = re.search(r"minute(?:_10)?=(\d+)", prefix)
 
     if dt_m and hour_m and minute_m:
         return {
@@ -162,7 +160,7 @@ def _parse_gold_partition(prefix: str) -> dict[str, str]:
 
 def _build_rag_s3_key(partition: dict[str, str]) -> str:
     """
-    → rag_result/dt=2026-03-28_hour=14_minute=10_rag_results.jsonl
+    → rag_result/dt=2026-03-29_hour=01_minute=50_rag_results.jsonl
     """
     dt     = partition["dt"]
     hour   = int(partition["hour"])
@@ -316,29 +314,29 @@ def _calc_suspicion_score(session: dict, repeat_count: int = 1) -> int:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Task 0-a : resolve_session_gold_prefix
+# Task 0 : resolve_session_gold_prefix
 # ══════════════════════════════════════════════════════════════════════════════
 
-# resolve_session_gold_prefix — conf에서 session_key 수신으로 변경
 def resolve_session_gold_prefix(**ctx) -> None:
     """
     TriggerDagRunOperator conf에서 session_key 수신
     → prefix / partition 파싱 → XCom 전달.
 
-    conf 없을 경우(수동 트리거 등) S3에서 최신 _SUCCESS 탐색으로 fallback.
+    conf:
+      session_key    : 정확한 parquet 경로 (배치 식별)
+      source_run_id  : 트리거한 unified run_id (로깅용)
     """
-    # ── conf에서 session_key 수신 ─────────────────────────────────────────────
-    conf        = ctx["dag_run"].conf or {}
-    session_key = conf.get("session_key", "")
+    conf           = ctx["dag_run"].conf or {}
+    session_key    = conf.get("session_key", "")
+    source_run_id  = conf.get("source_run_id", "unknown")
+
+    logger.info("resolve_session_gold_prefix: source_run_id = %s", source_run_id)
 
     if session_key:
-        # unified_events_to_gold 에서 전달받은 정확한 parquet 경로
-        # gold/session_gold/dt=.../hour=.../minute_10=10/minute_10=10_session_gold.parquet
         prefix = session_key.rsplit("/", 1)[0] + "/"
-        logger.info("resolve_session_gold_prefix: conf session_key 수신 → prefix = %s", prefix)
-
+        logger.info("resolve_session_gold_prefix: conf session_key → prefix = %s", prefix)
     else:
-        # fallback: 수동 트리거 or conf 누락 시 S3에서 최신 _SUCCESS 탐색
+        # fallback: 수동 트리거 시 S3에서 최신 _SUCCESS 탐색
         logger.warning("resolve_session_gold_prefix: conf 없음 — S3 최신 _SUCCESS fallback")
         s3        = _s3_client()
         paginator = s3.get_paginator("list_objects_v2")
@@ -379,7 +377,6 @@ def load_session_gold(**ctx) -> None:
         task_ids="resolve_session_gold_prefix", key="gold_partition",
     ) or _parse_gold_partition(prefix)
 
-    # partition은 resolve에서 이미 파싱 완료 — 그대로 전달
     ctx["ti"].xcom_push(key="gold_partition", value=partition)
     logger.info("load_session_gold: prefix = %s, partition = %s", prefix, partition)
 
@@ -550,7 +547,7 @@ def build_subgraphs(**ctx) -> None:
                     "node_labels":           record["node_labels"],
                     "node_value":            record["node_value"],
                     "signature":             record["signature"],
-                    "category":             record["category"],
+                    "category":              record["category"],
                     "first_seen":            str(record["first_seen"]) if record["first_seen"] else None,
                     "last_seen":             str(record["last_seen"])  if record["last_seen"]  else None,
                     "related_session_count": record["related_session_count"],
@@ -650,7 +647,7 @@ def run_rag_analysis(**ctx) -> None:
     model        = _groq_model()
     results:     list[dict] = []
     use_fallback = False
-    inference_dt = _now_kst_iso()   # DAG 실행 시각 KST
+    inference_dt = _now_kst_iso()
 
     def _parse_response(raw: str) -> dict:
         try:
@@ -746,7 +743,7 @@ def run_rag_analysis(**ctx) -> None:
         "run_rag_analysis: %d 건 분석 완료 (inference_datetime: %s, fallback: %s)",
         len(results), inference_dt, use_fallback,
     )
-    ctx["ti"].xcom_push(key="rag_results",       value=results)
+    ctx["ti"].xcom_push(key="rag_results",        value=results)
     ctx["ti"].xcom_push(key="inference_datetime", value=inference_dt)
 
 
@@ -802,7 +799,7 @@ def report_rag_stats(**ctx) -> None:
         threat_dist[tt] = threat_dist.get(tt, 0) + 1
 
     logger.info("=" * 70)
-    logger.info("▶ neo4j_to_rag 추론 파이프라인 완료 요약 (v6 — S3KeySensor 즉시 트리거)")
+    logger.info("▶ neo4j_to_rag 추론 파이프라인 완료 요약 (v7)")
     logger.info("=" * 70)
     logger.info("  [입력]  session_gold 로드      : %d 세션", total_loaded)
     logger.info("  [필터]  화이트리스트 제외       : %d", filter_stats.get("whitelist_ip", 0))
@@ -832,17 +829,14 @@ default_args = {
 
 with DAG(
     dag_id="neo4j_to_rag",
-    description="추론 DAG — session_gold parquet → whitelist → Neo4j enrichment → Groq RAG (v6)",
+    description="추론 DAG — session_gold parquet → whitelist → Neo4j enrichment → Groq RAG (v7)",
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
-    schedule=None,
+    schedule=None,         # TriggerDagRunOperator 전용
     catchup=False,
-    max_active_runs=1,
+    max_active_runs=5,     # unified_events_to_gold 동시 실행 수와 맞춤
     tags=["cti", "graph-rag", "groq"],
 ) as dag:
-
-    # wait_for_session_gold Sensor 제거
-    # → TriggerDagRunOperator가 extract_sessions 완료 후 트리거하므로 불필요
 
     t_resolve  = PythonOperator(task_id="resolve_session_gold_prefix", python_callable=resolve_session_gold_prefix)
     t_load     = PythonOperator(task_id="load_session_gold",           python_callable=load_session_gold)

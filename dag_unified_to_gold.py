@@ -2,27 +2,30 @@
 dag_unified_events_to_gold.py
 S3 silver/common_records (Spark 파티션 parquet) → session_gold / entity_gold / relation_gold
 
-- gold 저장 형식: jsonl → parquet
-- gold 파티션 경로: silver 기준(dt/hour/minute_10) 맞춤
-    예) gold/session_gold/dt=2026-03-27/hour=20/minute_10=20/minute_10=20_session_gold.parquet
-- _s3_write_parquet() 에 _SUCCESS 마커 생성 추가
-    → neo4j_to_rag S3KeySensor 감지 기준
-- 스케줄: "*/10 * * * *"
-- wait_for_silver: S3KeysUnchangedSensor (silver prefix 업로드 완료 감지)
+[v9 변경점]
+  - max_active_runs: 1 → 4 (배치 동시 처리)
+  - wait_for_silver: S3KeysUnchangedSensor → PythonSensor
+    · 다음 minute_10 폴더가 생기면 현재 폴더 완성으로 판단
+    · 예) minute_10=10 처리 중 → minute_10=20 폴더 감지되면 통과
+  - _silver_sensor_prefix / _gold_s3_key: KST 변환 적용
+  - _ms_to_iso → _ms_to_kst_iso (KST 변환)
+  - _load_silver_records fallback 제거 (wait_for_silver 통과 후 없으면 에러)
+  - TriggerDagRunOperator: neo4j_to_rag 트리거 (session_key conf 전달)
 
 Pipeline:
-  [wait_for_silver]  ← S3KeysUnchangedSensor: silver prefix 업로드 완료 감지
+  [wait_for_silver]  ← PythonSensor: 다음 minute_10 폴더 감지 시 통과
           ↓
   [validate_input]   ← parquet 직접 로드 → 레코드 수 검증
           ↓
-  [extract_sessions] ← parquet 직접 로드 → session_gold → S3 parquet + _SUCCESS
+  [extract_sessions] ← session_gold → S3 parquet + _SUCCESS + trigger_neo4j_to_rag
           ↓
-  [extract_entities] ← parquet 직접 로드 + session_gold → entity_gold → S3 parquet + _SUCCESS
+  [extract_entities] ← entity_gold → S3 parquet + _SUCCESS
           ↓
-  [extract_relations]← parquet 직접 로드 + session_gold → relation_gold → S3 parquet + _SUCCESS
+  [extract_relations]← relation_gold → S3 parquet + _SUCCESS
           ↓
   [report_stats]     ← 요약 통계 로그 + Asset emit
 
+Author : Linda
 """
 
 from __future__ import annotations
@@ -35,16 +38,14 @@ from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
-
 from zoneinfo import ZoneInfo
 
 import boto3
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.providers.amazon.aws.sensors.s3 import S3KeysUnchangedSensor
-from airflow.sdk import Asset
-# ── 추가 import ───────────────────────────────────────────────────────────────
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.sensors.python import PythonSensor
+from airflow.sdk import Asset
 
 # ── S3 설정 ───────────────────────────────────────────────────────────────────
 S3_BUCKET        = "malware-project-bucket"
@@ -52,8 +53,7 @@ S3_SILVER_PREFIX = "silver/common_records/"
 S3_GOLD_PREFIX   = "gold"
 AWS_REGION       = "ap-northeast-2"
 
-DATA_DIR           = Path("/opt/airflow/data")
-LAST_MODIFIED_PATH = DATA_DIR / ".last_silver_modified"
+KST = ZoneInfo("Asia/Seoul")
 
 GOLD_SESSION_ASSET  = Asset("s3://malware-project-bucket/gold/session_gold")
 GOLD_ENTITY_ASSET   = Asset("s3://malware-project-bucket/gold/entity_gold")
@@ -61,7 +61,6 @@ GOLD_RELATION_ASSET = Asset("s3://malware-project-bucket/gold/relation_gold")
 
 logger = logging.getLogger(__name__)
 
-KST = ZoneInfo("Asia/Seoul")
 
 # ── 공통 S3 헬퍼 ──────────────────────────────────────────────────────────────
 
@@ -69,94 +68,15 @@ def _s3_client():
     return boto3.client("s3", region_name=AWS_REGION)
 
 
-# ── gold parquet 경로 생성 ────────────────────────────────────────────────────
+# ── KST 변환 헬퍼 ─────────────────────────────────────────────────────────────
 
-def _gold_s3_key(table: str, execution_date: datetime) -> str:
-    """
-    silver 파티션 경로 기준에 맞춘 gold parquet 경로.
-    예) gold/session_gold/dt=2026-03-27/hour=20/minute_10=20/minute_10=20_session_gold.parquet
-    """
-    # ── UTC → KST 변환 ────────────────────────────────────────────────────────
-    if execution_date.tzinfo is None:
-        execution_date = execution_date.replace(tzinfo=timezone.utc)
-    execution_date_kst = execution_date.astimezone(KST)
-
-    dt        = execution_date_kst.strftime("%Y-%m-%d")
-    hour      = execution_date_kst.strftime("%H")
-    minute_10 = f"{(execution_date_kst.minute // 10) * 10:02d}"
-    return (
-        f"{S3_GOLD_PREFIX}/{table}"
-        f"/dt={dt}/hour={hour}/minute_10={minute_10}"
-        f"/minute_10={minute_10}_{table}.parquet"
-    )
+def _to_kst(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(KST)
 
 
-def _silver_sensor_prefix(execution_date: datetime) -> str:
-    """
-    S3KeysUnchangedSensor 가 감시할 silver prefix.
-    DAG 실행 시각 기준 dt/hour/minute_10 으로 결정.
-    """
-    # ── UTC → KST 변환 ────────────────────────────────────────────────────────
-    if execution_date.tzinfo is None:
-        execution_date = execution_date.replace(tzinfo=timezone.utc)
-    execution_date_kst = execution_date.astimezone(KST)
-
-    dt        = execution_date_kst.strftime("%Y-%m-%d")
-    hour      = execution_date_kst.strftime("%H")
-    minute_10 = f"{(execution_date_kst.minute // 10) * 10:02d}"
-    return f"{S3_SILVER_PREFIX}dt={dt}/hour={hour}/minute_10={minute_10}/"
-
-
-# ── parquet 읽기/쓰기 ─────────────────────────────────────────────────────────
-
-def _s3_write_parquet(s3_key: str, records: list[dict]) -> None:
-    import pandas as pd
-    df  = pd.DataFrame(records)
-    buf = io.BytesIO()
-    df.to_parquet(buf, index=False)
-    buf.seek(0)
-    s3 = _s3_client()
-    s3.put_object(
-        Bucket=S3_BUCKET, Key=s3_key,
-        Body=buf.read(), ContentType="application/octet-stream",
-    )
-    # ── 쓰기 완료 마커 (_SUCCESS) ─────────────────────────────────────────────
-    # neo4j_to_rag S3KeySensor 가 이 파일을 감지해 "parquet 쓰기 완료"로 판단
-    success_key = s3_key.rsplit("/", 1)[0] + "/_SUCCESS"
-    s3.put_object(
-        Bucket=S3_BUCKET, Key=success_key,
-        Body=b"", ContentType="application/octet-stream",
-    )
-    logger.info(
-        "S3 parquet 업로드 완료: s3://%s/%s (%d 레코드) | _SUCCESS: %s",
-        S3_BUCKET, s3_key, len(records), success_key,
-    )
-
-
-def _s3_read_parquet(s3_key: str) -> list[dict]:
-    import pandas as pd
-    obj = _s3_client().get_object(Bucket=S3_BUCKET, Key=s3_key)
-    df  = pd.read_parquet(io.BytesIO(obj["Body"].read()))
-    return df.where(df.notna(), None).to_dict(orient="records")
-
-
-# ── silver prefix 헬퍼 ────────────────────────────────────────────────────────
-
-def _list_silver_parquet_keys(prefix: str | None = None) -> list[str]:
-    s3        = _s3_client()
-    paginator = s3.get_paginator("list_objects_v2")
-    target    = prefix or S3_SILVER_PREFIX
-    keys: list[str] = []
-    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=target):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith(".parquet") and not key.endswith("_SUCCESS"):
-                keys.append(key)
-    return keys
-
-
-
-def _ms_to_iso(ms: Any) -> str | None:
+def _ms_to_kst_iso(ms: Any) -> str | None:
     """Unix ms (int) 또는 ISO 문자열 → KST ISO 문자열."""
     if ms is None:
         return None
@@ -179,6 +99,95 @@ def _ms_to_iso(ms: Any) -> str | None:
         return str(ms)
 
 
+# ── gold parquet 경로 생성 ────────────────────────────────────────────────────
+
+def _gold_s3_key(table: str, execution_date: datetime) -> str:
+    """
+    KST 기준 gold parquet 경로.
+    예) gold/session_gold/dt=2026-03-29/hour=01/minute_10=50/minute_10=50_session_gold.parquet
+    """
+    kst       = _to_kst(execution_date)
+    dt        = kst.strftime("%Y-%m-%d")
+    hour      = kst.strftime("%H")
+    minute_10 = f"{(kst.minute // 10) * 10:02d}"
+    return (
+        f"{S3_GOLD_PREFIX}/{table}"
+        f"/dt={dt}/hour={hour}/minute_10={minute_10}"
+        f"/minute_10={minute_10}_{table}.parquet"
+    )
+
+
+def _silver_sensor_prefix(execution_date: datetime) -> str:
+    """KST 기준 silver prefix."""
+    kst       = _to_kst(execution_date)
+    dt        = kst.strftime("%Y-%m-%d")
+    hour      = kst.strftime("%H")
+    minute_10 = f"{(kst.minute // 10) * 10:02d}"
+    return f"{S3_SILVER_PREFIX}dt={dt}/hour={hour}/minute_10={minute_10}/"
+
+
+def _next_silver_prefix(execution_date: datetime) -> str:
+    """현재 배치의 다음 minute_10 silver prefix (KST 기준)."""
+    kst          = _to_kst(execution_date)
+    next_minute  = ((kst.minute // 10) + 1) * 10
+
+    if next_minute >= 60:
+        next_kst    = kst.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        next_minute = 0
+    else:
+        next_kst = kst
+
+    dt        = next_kst.strftime("%Y-%m-%d")
+    hour      = next_kst.strftime("%H")
+    return f"{S3_SILVER_PREFIX}dt={dt}/hour={hour}/minute_10={next_minute:02d}/"
+
+
+# ── parquet 읽기/쓰기 ─────────────────────────────────────────────────────────
+
+def _s3_write_parquet(s3_key: str, records: list[dict]) -> None:
+    import pandas as pd
+    df  = pd.DataFrame(records)
+    buf = io.BytesIO()
+    df.to_parquet(buf, index=False)
+    buf.seek(0)
+    s3 = _s3_client()
+    s3.put_object(
+        Bucket=S3_BUCKET, Key=s3_key,
+        Body=buf.read(), ContentType="application/octet-stream",
+    )
+    # 쓰기 완료 마커
+    success_key = s3_key.rsplit("/", 1)[0] + "/_SUCCESS"
+    s3.put_object(
+        Bucket=S3_BUCKET, Key=success_key,
+        Body=b"", ContentType="application/octet-stream",
+    )
+    logger.info(
+        "S3 parquet 업로드 완료: s3://%s/%s (%d 레코드) | _SUCCESS: %s",
+        S3_BUCKET, s3_key, len(records), success_key,
+    )
+
+
+def _s3_read_parquet(s3_key: str) -> list[dict]:
+    import pandas as pd
+    obj = _s3_client().get_object(Bucket=S3_BUCKET, Key=s3_key)
+    df  = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+    return df.where(df.notna(), None).to_dict(orient="records")
+
+
+# ── silver prefix 헬퍼 ────────────────────────────────────────────────────────
+
+def _list_silver_parquet_keys(prefix: str) -> list[str]:
+    s3        = _s3_client()
+    paginator = s3.get_paginator("list_objects_v2")
+    keys: list[str] = []
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.endswith(".parquet") and "_SUCCESS" not in key:
+                keys.append(key)
+    return keys
+
+
 # ── silver parquet 로딩 공통 헬퍼 ────────────────────────────────────────────
 
 def _load_silver_records(ctx) -> list[dict]:
@@ -193,9 +202,7 @@ def _load_silver_records(ctx) -> list[dict]:
     keys   = _list_silver_parquet_keys(prefix)
 
     if not keys:
-        # logger.warning("해당 minute_10 prefix 에 parquet 없음 — 전체 silver prefix 로 fallback")
-        # keys = _list_silver_parquet_keys()
-        # wait_for_silver 통과 후 여기 오면 안 됨 — 에러로 처리
+        # wait_for_silver 통과 후 여기 오면 안 됨
         raise ValueError(f"silver parquet 없음 — prefix: {prefix}")
 
     s3 = _s3_client()
@@ -233,8 +240,8 @@ def _load_silver_records(ctx) -> list[dict]:
 
     for _, row in df.iterrows():
         record: dict[str, Any] = {k: _convert(v) for k, v in row.to_dict().items()}
-        record["flow_start"] = _ms_to_iso(record.get("flow_start"))
-        record["flow_end"]   = _ms_to_iso(record.get("flow_end"))
+        record["flow_start"] = _ms_to_kst_iso(record.get("flow_start"))
+        record["flow_end"]   = _ms_to_kst_iso(record.get("flow_end"))
 
         tl_raw = record.get("timeline", [])
         if isinstance(tl_raw, str):
@@ -288,6 +295,35 @@ def _make_session_id(community_id: str | None, idx: int) -> str:
 def _is_ip(value: str) -> bool:
     parts = value.split(".")
     return len(parts) == 4 and all(p.isdigit() for p in parts)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Sensor : wait_for_silver
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _check_next_partition_exists(**ctx) -> bool:
+    """
+    다음 minute_10 폴더가 S3에 존재하면 True → 현재 배치 완성으로 판단.
+    예) 현재=minute_10=10 → minute_10=20 폴더에 파일 있으면 통과.
+    """
+    execution_date: datetime = ctx["logical_date"]
+    next_prefix = _next_silver_prefix(execution_date)
+    keys        = _list_silver_parquet_keys(next_prefix)
+
+    if keys:
+        logger.info(
+            "wait_for_silver: 다음 파티션 감지 → 현재 배치 완성 판단\n"
+            "  next_prefix: %s (%d개)", next_prefix, len(keys),
+        )
+        return True
+
+    current_prefix = _silver_sensor_prefix(execution_date)
+    logger.info(
+        "wait_for_silver: 대기 중\n"
+        "  current: %s\n"
+        "  waiting: %s", current_prefix, next_prefix,
+    )
+    return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -765,7 +801,7 @@ def report_stats(**ctx) -> None:
     uid_count    = sum(1 for s in sessions if s.get("uid"))
 
     logger.info("=" * 65)
-    logger.info("▶ Gold 전처리 파이프라인 완료 요약 (v8 — parquet gold / minute_10 파티션)")
+    logger.info("▶ Gold 전처리 파이프라인 완료 요약 (v9)")
     logger.info("=" * 65)
     logger.info("  [Input]  silver/common_records (parquet) : %s 레코드", total_lines)
     logger.info(
@@ -801,31 +837,22 @@ default_args = {
 
 with DAG(
     dag_id="unified_events_to_gold",
-    description="Spark silver parquet → session/entity/relation gold 전처리 (v8)",
+    description="Spark silver parquet → session/entity/relation gold 전처리 (v9)",
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
     schedule="*/10 * * * *",
     catchup=False,
-    max_active_runs=1,
+    max_active_runs=4,    # 배치 동시 처리
     tags=["cti", "graph-rag", "preprocessing"],
 ) as dag:
 
-    wait_for_silver = S3KeysUnchangedSensor(
+    # 다음 minute_10 폴더가 생기면 현재 배치 완성으로 판단
+    wait_for_silver = PythonSensor(
         task_id="wait_for_silver",
-        bucket_name=S3_BUCKET,
-        # 수정 — 템플릿 안에서 KST 변환
-        prefix=(
-            f"{S3_SILVER_PREFIX}"
-            "dt={{ (logical_date + macros.timedelta(hours=9)).strftime('%Y-%m-%d') }}"
-            "/hour={{ (logical_date + macros.timedelta(hours=9)).strftime('%H') }}"
-            "/minute_10={{ '%02d' % (((logical_date + macros.timedelta(hours=9)).minute // 10) * 10) }}/"
-        ),
+        python_callable=_check_next_partition_exists,
         poke_interval=60,
-        inactivity_period=300,
-        min_objects=1,
-        timeout=60 * 30,
+        timeout=60 * 60,   # 최대 1시간 대기
         mode="poke",
-        aws_conn_id="aws_default",
     )
 
     t_validate  = PythonOperator(task_id="validate_input",    python_callable=validate_input)
@@ -838,18 +865,19 @@ with DAG(
         outlets=[GOLD_SESSION_ASSET, GOLD_ENTITY_ASSET, GOLD_RELATION_ASSET],
     )
 
-    # ── neo4j_to_rag 트리거 ───────────────────────────────────────────────────
-    # extract_sessions 완료(session_gold + _SUCCESS 생성) 직후 트리거
-    # session_key를 conf로 전달 → neo4j_to_rag가 해당 배치만 읽도록 보장
+    # extract_sessions 완료 직후 neo4j_to_rag 트리거
+    # run_id를 conf로 전달 → gold_to_neo4j / neo4j_to_rag 가 정확한 배치 식별
     t_trigger_rag = TriggerDagRunOperator(
         task_id="trigger_neo4j_to_rag",
         trigger_dag_id="neo4j_to_rag",
-        wait_for_completion=False,    # 트리거만 하고 기다리지 않음 (병렬 진행)
-        conf={"session_key": "{{ ti.xcom_pull(task_ids='extract_sessions', key='session_key') }}"},
-        reset_dag_run=True,           # 같은 conf로 재실행 시 이전 run 초기화
+        wait_for_completion=False,
+        conf={
+            "session_key": "{{ ti.xcom_pull(task_ids='extract_sessions', key='session_key') }}",
+            "source_run_id": "{{ run_id }}",   # ← run_id 전달 (gold_to_neo4j XCom 조회용)
+        },
+        reset_dag_run=True,
     )
 
-    # extract_sessions 완료 → rag 트리거 + entity/relation 병렬 진행
     wait_for_silver >> t_validate >> t_sessions
-    t_sessions >> t_trigger_rag                          # rag 즉시 트리거
-    t_sessions >> t_entities >> t_relations >> t_report  # gold 나머지 계속
+    t_sessions >> t_trigger_rag
+    t_sessions >> t_entities >> t_relations >> t_report
