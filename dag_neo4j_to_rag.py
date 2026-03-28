@@ -856,38 +856,41 @@ def run_rag_analysis(**ctx) -> None:
     groq    = _groq_client()
     model   = _groq_model()
     results: list[dict] = []
+    use_fallback = False  # 한 번 RateLimit 걸리면 이후 세션 전부 8b로 전환
+
+    def _parse_response(raw: str) -> dict:
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            cleaned = raw.replace("```json", "").replace("```", "").strip()
+            try:
+                return json.loads(cleaned)
+            except json.JSONDecodeError:
+                return {"raw_response": raw, "parse_error": True}
+
+    def _append_result(response) -> None:
+        raw      = response.choices[0].message.content.strip()
+        analysis = _parse_response(raw)
+        results.append({
+            "session_id": session_id,
+            "uid":        sg["session"].get("uid"),
+            "session":    sg["session"],
+            "analysis":   {
+                **analysis,
+                "threat_score": sg["session"].get("suspicion_score", 0),
+            },
+            "neighbors": sg.get("neighbors", []),
+        })
 
     for i, sg in enumerate(subgraphs):
         session_id = sg["session"].get("session_id", f"unknown_{i}")
         user_text  = _subgraph_to_text(sg)
-
-        def _parse_response(raw: str) -> dict:
-            try:
-                return json.loads(raw)
-            except json.JSONDecodeError:
-                cleaned = raw.replace("```json", "").replace("```", "").strip()
-                try:
-                    return json.loads(cleaned)
-                except json.JSONDecodeError:
-                    return {"raw_response": raw, "parse_error": True}
-
-        def _append_result(response) -> None:
-            raw      = response.choices[0].message.content.strip()
-            analysis = _parse_response(raw)
-            results.append({
-                "session_id": session_id,
-                "uid":        sg["session"].get("uid"),
-                "session":    sg["session"],
-                "analysis":   {
-                    **analysis,
-                    "threat_score": sg["session"].get("suspicion_score", 0),
-                },
-                "neighbors": sg.get("neighbors", []),
-            })
+        # current_model = "llama-3.1-8b-instant" if use_fallback else model
+        current_model = "openai/gpt-oss-120b" if use_fallback else model
 
         try:
             response = groq.chat.completions.create(
-                model=model,
+                model=current_model,
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user",   "content": user_text},
@@ -898,10 +901,20 @@ def run_rag_analysis(**ctx) -> None:
             _append_result(response)
 
         except RateLimitError as e:
-            logger.warning(
-                "run_rag_analysis: session_id=%s Rate Limit — 60초 대기 후 8b로 재시도", session_id
-            )
-            time.sleep(60)
+            if not use_fallback:
+                logger.warning(
+                    "run_rag_analysis: session_id=%s Rate Limit — 60초 대기 후 이후 전체 세션 8b로 전환",
+                    session_id,
+                )
+                use_fallback = True
+                time.sleep(60)
+            else:
+                logger.warning(
+                    "run_rag_analysis: session_id=%s 8b도 Rate Limit — 2초 대기 후 재시도",
+                    session_id,
+                )
+                time.sleep(2)
+
             try:
                 response = groq.chat.completions.create(
                     model="llama-3.1-8b-instant",
@@ -937,9 +950,9 @@ def run_rag_analysis(**ctx) -> None:
 
         time.sleep(GROQ_RPM_SLEEP)
 
-    logger.info("run_rag_analysis: %d 건 분석 완료", len(results))
+    logger.info("run_rag_analysis: %d 건 분석 완료 (fallback 사용: %s)", len(results), use_fallback)
     ctx["ti"].xcom_push(key="rag_results", value=results)
-    
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Task 6 : save_rag_results
 # ══════════════════════════════════════════════════════════════════════════════
