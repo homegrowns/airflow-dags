@@ -36,6 +36,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
+from zoneinfo import ZoneInfo
+
 import boto3
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -59,6 +61,7 @@ GOLD_RELATION_ASSET = Asset("s3://malware-project-bucket/gold/relation_gold")
 
 logger = logging.getLogger(__name__)
 
+KST = ZoneInfo("Asia/Seoul")
 
 # ── 공통 S3 헬퍼 ──────────────────────────────────────────────────────────────
 
@@ -142,15 +145,26 @@ def _list_silver_parquet_keys(prefix: str | None = None) -> list[str]:
     return keys
 
 
-# ── Unix ms timestamp → ISO UTC 문자열 ───────────────────────────────────────
 
 def _ms_to_iso(ms: Any) -> str | None:
+    """Unix ms (int) 또는 ISO 문자열 → KST ISO 문자열."""
     if ms is None:
         return None
     if isinstance(ms, str):
-        return ms
+        try:
+            s = ms.replace(" ", "T")
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(KST).isoformat()
+        except Exception:
+            return ms
     try:
-        return datetime.fromtimestamp(int(ms) / 1000.0, tz=timezone.utc).isoformat()
+        return datetime.fromtimestamp(
+            int(ms) / 1000.0, tz=timezone.utc
+        ).astimezone(KST).isoformat()
     except (ValueError, TypeError, OSError):
         return str(ms)
 
