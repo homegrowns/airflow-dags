@@ -843,6 +843,7 @@ with DAG(
     schedule="*/10 * * * *",
     catchup=False,
     max_active_runs=4,    # 배치 동시 처리
+    concurrency=4,
     tags=["cti", "graph-rag", "preprocessing"],
 ) as dag:
 
