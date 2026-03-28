@@ -834,7 +834,7 @@ with DAG(
     start_date=datetime(2026, 1, 1),
     schedule=None,         # TriggerDagRunOperator 전용
     catchup=False,
-    max_active_runs=5,     # unified_events_to_gold 동시 실행 수와 맞춤
+    max_active_runs=4,     # unified_events_to_gold 동시 실행 수와 맞춤
     tags=["cti", "graph-rag", "groq"],
 ) as dag:
 
