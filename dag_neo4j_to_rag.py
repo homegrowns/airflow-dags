@@ -46,7 +46,7 @@ import boto3
 from airflow import DAG
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator
-from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
+# from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
 
 logger = logging.getLogger(__name__)
 
@@ -319,29 +319,45 @@ def _calc_suspicion_score(session: dict, repeat_count: int = 1) -> int:
 # Task 0-a : resolve_session_gold_prefix
 # ══════════════════════════════════════════════════════════════════════════════
 
+# resolve_session_gold_prefix — conf에서 session_key 수신으로 변경
 def resolve_session_gold_prefix(**ctx) -> None:
     """
-    S3에서 가장 최근 _SUCCESS 파일을 찾아 해당 배치의 prefix / partition 파싱.
-    wait_for_session_gold Sensor 통과 직후 실행.
+    TriggerDagRunOperator conf에서 session_key 수신
+    → prefix / partition 파싱 → XCom 전달.
+
+    conf 없을 경우(수동 트리거 등) S3에서 최신 _SUCCESS 탐색으로 fallback.
     """
-    s3        = _s3_client()
-    paginator = s3.get_paginator("list_objects_v2")
+    # ── conf에서 session_key 수신 ─────────────────────────────────────────────
+    conf        = ctx["dag_run"].conf or {}
+    session_key = conf.get("session_key", "")
 
-    success_keys: list[tuple[datetime, str]] = []
-    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=S3_SESSION_GOLD_PREFIX):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith("/_SUCCESS"):
-                success_keys.append((obj["LastModified"], key))
+    if session_key:
+        # unified_events_to_gold 에서 전달받은 정확한 parquet 경로
+        # gold/session_gold/dt=.../hour=.../minute_10=10/minute_10=10_session_gold.parquet
+        prefix = session_key.rsplit("/", 1)[0] + "/"
+        logger.info("resolve_session_gold_prefix: conf session_key 수신 → prefix = %s", prefix)
 
-    if not success_keys:
-        raise ValueError("resolve_session_gold_prefix: _SUCCESS 파일 없음")
+    else:
+        # fallback: 수동 트리거 or conf 누락 시 S3에서 최신 _SUCCESS 탐색
+        logger.warning("resolve_session_gold_prefix: conf 없음 — S3 최신 _SUCCESS fallback")
+        s3        = _s3_client()
+        paginator = s3.get_paginator("list_objects_v2")
 
-    _, latest_success = max(success_keys, key=lambda x: x[0])
-    prefix    = latest_success.rsplit("/", 1)[0] + "/"
+        success_keys: list[tuple[datetime, str]] = []
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=S3_SESSION_GOLD_PREFIX):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if key.endswith("/_SUCCESS"):
+                    success_keys.append((obj["LastModified"], key))
+
+        if not success_keys:
+            raise ValueError("resolve_session_gold_prefix: _SUCCESS 파일 없음")
+
+        _, latest_success = max(success_keys, key=lambda x: x[0])
+        prefix = latest_success.rsplit("/", 1)[0] + "/"
+        logger.info("resolve_session_gold_prefix: 최신 _SUCCESS → prefix = %s", prefix)
+
     partition = _parse_gold_partition(prefix)
-
-    logger.info("resolve_session_gold_prefix: prefix    = %s", prefix)
     logger.info("resolve_session_gold_prefix: partition = %s", partition)
 
     ctx["ti"].xcom_push(key="session_gold_prefix", value=prefix)
@@ -819,23 +835,14 @@ with DAG(
     description="추론 DAG — session_gold parquet → whitelist → Neo4j enrichment → Groq RAG (v6)",
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
-    schedule="*/10 * * * *",   # unified_events_to_gold 와 동일 주기
+    schedule=None,
     catchup=False,
     max_active_runs=1,
     tags=["cti", "graph-rag", "groq"],
 ) as dag:
 
-    # _SUCCESS 감지 → 즉시 트리거 (15초 폴링)
-    t_sensor = S3KeySensor(
-        task_id="wait_for_session_gold",
-        bucket_name=S3_BUCKET,
-        bucket_key=S3_SESSION_GOLD_PREFIX + "*/_SUCCESS",
-        wildcard_match=True,
-        aws_conn_id="aws_default",
-        poke_interval=15,
-        timeout=1800,
-        mode="poke",
-    )
+    # wait_for_session_gold Sensor 제거
+    # → TriggerDagRunOperator가 extract_sessions 완료 후 트리거하므로 불필요
 
     t_resolve  = PythonOperator(task_id="resolve_session_gold_prefix", python_callable=resolve_session_gold_prefix)
     t_load     = PythonOperator(task_id="load_session_gold",           python_callable=load_session_gold)
@@ -845,4 +852,4 @@ with DAG(
     t_save     = PythonOperator(task_id="save_rag_results",            python_callable=save_rag_results)
     t_report   = PythonOperator(task_id="report_rag_stats",            python_callable=report_rag_stats)
 
-    t_sensor >> t_resolve >> t_load >> t_filter >> t_subgraph >> t_rag >> t_save >> t_report
+    t_resolve >> t_load >> t_filter >> t_subgraph >> t_rag >> t_save >> t_report

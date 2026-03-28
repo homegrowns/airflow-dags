@@ -41,6 +41,8 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.amazon.aws.sensors.s3 import S3KeysUnchangedSensor
 from airflow.sdk import Asset
+# ── 추가 import ───────────────────────────────────────────────────────────────
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 # ── S3 설정 ───────────────────────────────────────────────────────────────────
 S3_BUCKET        = "malware-project-bucket"
@@ -809,4 +811,18 @@ with DAG(
         outlets=[GOLD_SESSION_ASSET, GOLD_ENTITY_ASSET, GOLD_RELATION_ASSET],
     )
 
-    wait_for_silver >> t_validate >> t_sessions >> t_entities >> t_relations >> t_report
+    # ── neo4j_to_rag 트리거 ───────────────────────────────────────────────────
+    # extract_sessions 완료(session_gold + _SUCCESS 생성) 직후 트리거
+    # session_key를 conf로 전달 → neo4j_to_rag가 해당 배치만 읽도록 보장
+    t_trigger_rag = TriggerDagRunOperator(
+        task_id="trigger_neo4j_to_rag",
+        trigger_dag_id="neo4j_to_rag",
+        wait_for_completion=False,    # 트리거만 하고 기다리지 않음 (병렬 진행)
+        conf={"session_key": "{{ ti.xcom_pull(task_ids='extract_sessions', key='session_key') }}"},
+        reset_dag_run=True,           # 같은 conf로 재실행 시 이전 run 초기화
+    )
+
+    # extract_sessions 완료 → rag 트리거 + entity/relation 병렬 진행
+    wait_for_silver >> t_validate >> t_sessions
+    t_sessions >> t_trigger_rag                          # rag 즉시 트리거
+    t_sessions >> t_entities >> t_relations >> t_report  # gold 나머지 계속
