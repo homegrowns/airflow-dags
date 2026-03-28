@@ -1,67 +1,70 @@
 """
 dag_gold_to_neo4j.py
-Gold JSONL (S3) → Neo4j 그래프 적재 DAG  (v5 — uid / dest_* 반영)
+Gold parquet (S3) → Neo4j 그래프 적재 DAG (v6 — parquet 전환 / session_key XCom 연동)
 
-[v5 변경점]
-  - :Session 노드에 uid 속성 추가 (원본 로그 역추적용)
-  - dst_ip / dst_port → dest_ip / dest_port 필드명 통일
-  - CLEAR_GRAPH_ENABLED Variable로 clear_graph on/off 제어
-    Airflow Admin → Variables → CLEAR_GRAPH_ENABLED = "true" | "false"
-    (기본값 "true" — 값 없으면 초기화 실행)
+- 입력 형식: JSONL → parquet
+- unified_events_to_gold.extract_sessions XCom(session_key) 수신
+→ session / entity / relation parquet 경로 동적 결정 (_sibling_key)
+- load_sessions: session_gold prefix → neo4j_to_rag XCom 전달
+- 전체 ts → KST 변환
 
 Pipeline:
   [clear_graph]    ← CLEAR_GRAPH_ENABLED=true 일 때만 Neo4j 전체 초기화
        ↓
-  [load_sessions]  ← session_gold.jsonl → (:Session) 노드
+  [load_sessions]  ← session_gold parquet → (:Session) 노드
        ↓
-  [load_entities]  ← entity_gold.jsonl  → (:IP) / (:Domain) / (:Alert)
+  [load_entities]  ← entity_gold parquet  → (:IP) / (:Domain) / (:Alert)
        ↓
-  [load_relations] ← relation_gold.jsonl → 관계 엣지
+  [load_relations] ← relation_gold parquet → 관계 엣지
        ↓
   [create_indexes] ← 인덱스 / 제약 조건 생성 (멱등)
        ↓
   [report_stats]   ← Neo4j 카운트 로그
-
-Author : Linda
 """
 
 from __future__ import annotations
 
-from airflow.sdk import Asset
-
-import json
+import io
 import logging
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from zoneinfo import ZoneInfo
 
 import boto3
 from airflow import DAG
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator
+from airflow.sdk import Asset
 
 logger = logging.getLogger(__name__)
 
-S3_BUCKET       = "malware-project-bucket"
-S3_SESSION_KEY  = "gold/session_gold.jsonl"
-S3_ENTITY_KEY   = "gold/entity_gold.jsonl"
-S3_RELATION_KEY = "gold/relation_gold.jsonl"
-AWS_REGION      = "ap-northeast-2"
-BATCH_SIZE      = 10000
+KST = ZoneInfo("Asia/Seoul")
 
-GOLD_SESSION_ASSET  = Asset("s3://malware-project-bucket/gold/session_gold.jsonl")
-GOLD_ENTITY_ASSET   = Asset("s3://malware-project-bucket/gold/entity_gold.jsonl")
-GOLD_RELATION_ASSET = Asset("s3://malware-project-bucket/gold/relation_gold.jsonl")
+S3_BUCKET              = "malware-project-bucket"
+S3_SESSION_GOLD_PREFIX = "gold/session_gold/"
+AWS_REGION             = "ap-northeast-2"
+BATCH_SIZE             = 10000
+
+GOLD_SESSION_ASSET  = Asset("s3://malware-project-bucket/gold/session_gold")
+GOLD_ENTITY_ASSET   = Asset("s3://malware-project-bucket/gold/entity_gold")
+GOLD_RELATION_ASSET = Asset("s3://malware-project-bucket/gold/relation_gold")
 
 
-# ── 공통 헬퍼 ─────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# 공통 헬퍼
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _s3_client():
     return boto3.client("s3", region_name=AWS_REGION)
 
-def _s3_read_jsonl(s3_key: str) -> list[dict]:
-    s3  = _s3_client()
-    obj = s3.get_object(Bucket=S3_BUCKET, Key=s3_key)
-    return [json.loads(line) for line in obj["Body"].read().decode("utf-8").splitlines() if line.strip()]
+
+def _s3_read_parquet(s3_key: str) -> list[dict]:
+    import pandas as pd
+    obj = _s3_client().get_object(Bucket=S3_BUCKET, Key=s3_key)
+    df  = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+    return df.where(df.notna(), None).to_dict(orient="records")
+
 
 def _neo4j_driver():
     from neo4j import GraphDatabase
@@ -70,31 +73,60 @@ def _neo4j_driver():
     pw   = Variable.get("NEO4J_PASSWORD")
     return GraphDatabase.driver(uri, auth=(user, pw))
 
+
 def _run_batches(session, query: str, records: list[dict], batch_size: int = BATCH_SIZE) -> int:
     total = 0
     for i in range(0, len(records), batch_size):
-        session.run(query, rows=records[i:i+batch_size])
-        total += len(records[i:i+batch_size])
+        session.run(query, rows=records[i : i + batch_size])
+        total += len(records[i : i + batch_size])
     return total
 
 
-# ── Task 1 : clear_graph ──────────────────────────────────────────────────────
+def _sibling_key(session_key: str, table: str) -> str:
+    """session_key 경로에서 테이블명만 교체."""
+    return session_key.replace("session_gold", table)
+
+
+def _prefix_from_key(s3_key: str) -> str:
+    """parquet 경로 → 디렉터리 prefix."""
+    return s3_key.rsplit("/", 1)[0] + "/"
+
+
+def _to_kst_iso(ts: Any) -> str | None:
+    if ts is None:
+        return None
+    if isinstance(ts, str):
+        try:
+            s = ts.replace(" ", "T")
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(KST).isoformat()
+        except Exception:
+            return ts
+    try:
+        v = float(ts)
+        if v > 1e10:
+            v /= 1000.0
+        return datetime.fromtimestamp(v, tz=timezone.utc).astimezone(KST).isoformat()
+    except Exception:
+        return str(ts)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Task 1 : clear_graph
+# ══════════════════════════════════════════════════════════════════════════════
 
 def clear_graph(**ctx) -> None:
-    """
-    CLEAR_GRAPH_ENABLED Variable가 'false'이면 스킵.
-    기본값(Variable 없음 또는 'true')이면 전체 초기화.
-    """
     enabled = Variable.get("CLEAR_GRAPH_ENABLED", default_var="true").lower()
     if enabled == "false":
         logger.info("clear_graph: CLEAR_GRAPH_ENABLED=false — 초기화 스킵")
         return
-
     driver = _neo4j_driver()
-    labels = ["Session", "IP", "Domain", "Alert", "Cipher"]
-
     with driver.session() as neo_sess:
-        for label in labels:
+        for label in ["Session", "IP", "Domain", "Alert", "Cipher"]:
             deleted = 10000
             while deleted == 10000:
                 result  = neo_sess.run(
@@ -102,12 +134,13 @@ def clear_graph(**ctx) -> None:
                 )
                 deleted = result.single()["deleted"]
             logger.info("clear_graph: :%s 전체 삭제 완료", label)
-
     driver.close()
     logger.info("clear_graph 완료")
 
 
-# ── Task 2 : load_sessions ────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Task 2 : load_sessions
+# ══════════════════════════════════════════════════════════════════════════════
 
 _SESSION_QUERY = """
 UNWIND $rows AS r
@@ -164,16 +197,37 @@ SET
 """
 
 def load_sessions(**ctx) -> None:
-    records = _s3_read_jsonl(S3_SESSION_KEY)
-    driver  = _neo4j_driver()
+    session_key: str = ctx["ti"].xcom_pull(
+        dag_id="unified_events_to_gold",
+        task_ids="extract_sessions",
+        key="session_key",
+    )
+    if not session_key:
+        raise ValueError("load_sessions: session_key XCom 없음")
+    logger.info("load_sessions: session_key = %s", session_key)
+
+    records = _s3_read_parquet(session_key)
+    for r in records:
+        r["flow_start"] = _to_kst_iso(r.get("flow_start"))
+        r["flow_end"]   = _to_kst_iso(r.get("flow_end"))
+        r["ts"]         = _to_kst_iso(r.get("ts"))
+
+    driver = _neo4j_driver()
     with driver.session() as neo_sess:
         total = _run_batches(neo_sess, _SESSION_QUERY, records)
     driver.close()
     logger.info("load_sessions 완료 — %d 세션 노드", total)
-    ctx["ti"].xcom_push(key="session_count", value=total)
+
+    session_gold_prefix = _prefix_from_key(session_key)
+    ctx["ti"].xcom_push(key="session_count",       value=total)
+    ctx["ti"].xcom_push(key="session_key",         value=session_key)
+    ctx["ti"].xcom_push(key="session_gold_prefix", value=session_gold_prefix)
+    logger.info("load_sessions: session_gold prefix → %s", session_gold_prefix)
 
 
-# ── Task 3 : load_entities ────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Task 3 : load_entities
+# ══════════════════════════════════════════════════════════════════════════════
 
 _IP_QUERY = """
 UNWIND $rows AS r
@@ -197,14 +251,23 @@ SET n.first_seen=r.first_seen, n.last_seen=r.last_seen,
 """
 
 def load_entities(**ctx) -> None:
-    records   = _s3_read_jsonl(S3_ENTITY_KEY)
+    session_key: str = ctx["ti"].xcom_pull(task_ids="load_sessions", key="session_key")
+    entity_key       = _sibling_key(session_key, "entity_gold")
+    logger.info("load_entities: entity_key = %s", entity_key)
+
+    records = _s3_read_parquet(entity_key)
     buckets: dict[str, list[dict]] = defaultdict(list)
-    for r in records: buckets[r["entity_type"]].append(r)
+    for r in records:
+        buckets[r["entity_type"]].append(r)
 
     driver = _neo4j_driver()
     counts: dict[str, int] = {}
     with driver.session() as neo_sess:
-        for etype, query in [("ip",_IP_QUERY),("domain",_DOMAIN_QUERY),("alert",_ALERT_QUERY)]:
+        for etype, query in [
+            ("ip",     _IP_QUERY),
+            ("domain", _DOMAIN_QUERY),
+            ("alert",  _ALERT_QUERY),
+        ]:
             rows = buckets.get(etype, [])
             if rows:
                 counts[etype] = _run_batches(neo_sess, query, rows)
@@ -215,7 +278,9 @@ def load_entities(**ctx) -> None:
     ctx["ti"].xcom_push(key="entity_count", value=total)
 
 
-# ── Task 4 : load_relations ───────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Task 4 : load_relations
+# ══════════════════════════════════════════════════════════════════════════════
 
 _SESSION_CONN_QUERY = """
 UNWIND $rows AS r
@@ -230,31 +295,33 @@ MATCH (dst:IP      {value:      r.src_ip})
 MERGE (src)-[:ORIGINATED_FROM {session_id: r.session_id}]->(dst)
 """
 _RELATION_QUERIES: dict[str, str] = {
-    "REQUESTED_domain": "UNWIND $rows AS r MATCH (src:IP {value:r.src_value}) MATCH (dst:Domain {value:r.dst_value}) MERGE (src)-[:REQUESTED {session_id:r.session_id}]->(dst)",
-    "REQUESTED_ip":     "UNWIND $rows AS r MATCH (src:IP {value:r.src_value}) MATCH (dst:IP     {value:r.dst_value}) MERGE (src)-[:REQUESTED {session_id:r.session_id}]->(dst)",
-    "RESOLVED_BY_ip":   "UNWIND $rows AS r MATCH (src:Domain {value:r.src_value}) MATCH (dst:IP     {value:r.dst_value}) MERGE (src)-[:RESOLVED_BY {session_id:r.session_id}]->(dst)",
+    "REQUESTED_domain":  "UNWIND $rows AS r MATCH (src:IP {value:r.src_value}) MATCH (dst:Domain {value:r.dst_value}) MERGE (src)-[:REQUESTED {session_id:r.session_id}]->(dst)",
+    "REQUESTED_ip":      "UNWIND $rows AS r MATCH (src:IP {value:r.src_value}) MATCH (dst:IP     {value:r.dst_value}) MERGE (src)-[:REQUESTED {session_id:r.session_id}]->(dst)",
+    "RESOLVED_BY_ip":    "UNWIND $rows AS r MATCH (src:Domain {value:r.src_value}) MATCH (dst:IP     {value:r.dst_value}) MERGE (src)-[:RESOLVED_BY {session_id:r.session_id}]->(dst)",
     "RESOLVED_BY_domain":"UNWIND $rows AS r MATCH (src:Domain {value:r.src_value}) MATCH (dst:Domain {value:r.dst_value}) MERGE (src)-[:RESOLVED_BY {session_id:r.session_id}]->(dst)",
-    "TRIGGERED":        "UNWIND $rows AS r MATCH (src:Session {session_id:r.src_value}) MATCH (dst:Alert {value:r.dst_value}) MERGE (src)-[:TRIGGERED {session_id:r.session_id}]->(dst)",
-    "SERVED_OVER_TLS":  "UNWIND $rows AS r MATCH (src:Session {session_id:r.src_value}) MERGE (dst:Domain {value:r.dst_value}) MERGE (src)-[:SERVED_OVER_TLS {session_id:r.session_id}]->(dst)",
-    "ENCRYPTED_WITH":   "UNWIND $rows AS r MATCH (src:Session {session_id:r.src_value}) MERGE (dst:Cipher {value:r.dst_value}) MERGE (src)-[:ENCRYPTED_WITH {session_id:r.session_id}]->(dst)",
+    "TRIGGERED":         "UNWIND $rows AS r MATCH (src:Session {session_id:r.src_value}) MATCH (dst:Alert {value:r.dst_value}) MERGE (src)-[:TRIGGERED {session_id:r.session_id}]->(dst)",
+    "SERVED_OVER_TLS":   "UNWIND $rows AS r MATCH (src:Session {session_id:r.src_value}) MERGE (dst:Domain {value:r.dst_value}) MERGE (src)-[:SERVED_OVER_TLS {session_id:r.session_id}]->(dst)",
+    "ENCRYPTED_WITH":    "UNWIND $rows AS r MATCH (src:Session {session_id:r.src_value}) MERGE (dst:Cipher {value:r.dst_value}) MERGE (src)-[:ENCRYPTED_WITH {session_id:r.session_id}]->(dst)",
 }
 
 def load_relations(**ctx) -> None:
-    raw_relations = _s3_read_jsonl(S3_RELATION_KEY)
-    sessions      = _s3_read_jsonl(S3_SESSION_KEY)
-    sess_dst: list[dict] = []
-    sess_src: list[dict] = []
+    session_key: str = ctx["ti"].xcom_pull(task_ids="load_sessions", key="session_key")
+    relation_key     = _sibling_key(session_key, "relation_gold")
+    logger.info("load_relations: relation_key = %s", relation_key)
+
+    raw_relations = _s3_read_parquet(relation_key)
+    sessions      = _s3_read_parquet(session_key)
 
     driver = _neo4j_driver()
     with driver.session() as neo_sess:
-        sess_dst = [{"session_id": s["session_id"], "dest_ip": s["dest_ip"]}   # [v5]
+        sess_dst = [{"session_id": s["session_id"], "dest_ip": s["dest_ip"]}
                     for s in sessions if s.get("dest_ip")]
+        sess_src = [{"session_id": s["session_id"], "src_ip":  s["src_ip"]}
+                    for s in sessions if s.get("src_ip")]
+
         if sess_dst:
             cnt = _run_batches(neo_sess, _SESSION_CONN_QUERY, sess_dst)
             logger.info("load_relations: Session-[:CONNECTED_TO]→IP  %d", cnt)
-
-        sess_src = [{"session_id": s["session_id"], "src_ip": s["src_ip"]}
-                    for s in sessions if s.get("src_ip")]
         if sess_src:
             cnt = _run_batches(neo_sess, _SESSION_ORIG_QUERY, sess_src)
             logger.info("load_relations: Session-[:ORIGINATED_FROM]→IP  %d", cnt)
@@ -263,8 +330,9 @@ def load_relations(**ctx) -> None:
         for r in raw_relations:
             rel = r["relation_type"]
             dst = r.get("dst_type", "")
-            if rel == "CONNECTED_TO": continue
-            key = f"{rel}_{dst}" if rel in ("REQUESTED","RESOLVED_BY") else rel
+            if rel == "CONNECTED_TO":
+                continue
+            key = f"{rel}_{dst}" if rel in ("REQUESTED", "RESOLVED_BY") else rel
             buckets[key].append(r)
 
         counts: dict[str, int] = {}
@@ -282,7 +350,9 @@ def load_relations(**ctx) -> None:
     ctx["ti"].xcom_push(key="relation_count", value=total)
 
 
-# ── Task 5 : create_indexes ───────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Task 5 : create_indexes
+# ══════════════════════════════════════════════════════════════════════════════
 
 _CONSTRAINTS = [
     "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Session) REQUIRE n.session_id IS UNIQUE",
@@ -293,11 +363,11 @@ _CONSTRAINTS = [
 ]
 _INDEXES = [
     "CREATE INDEX IF NOT EXISTS FOR (n:Session) ON (n.community_id)",
-    "CREATE INDEX IF NOT EXISTS FOR (n:Session) ON (n.uid)",           # [신규 v5]
+    "CREATE INDEX IF NOT EXISTS FOR (n:Session) ON (n.uid)",
     "CREATE INDEX IF NOT EXISTS FOR (n:Session) ON (n.ts)",
     "CREATE INDEX IF NOT EXISTS FOR (n:Session) ON (n.is_threat)",
     "CREATE INDEX IF NOT EXISTS FOR (n:Session) ON (n.src_ip)",
-    "CREATE INDEX IF NOT EXISTS FOR (n:Session) ON (n.dest_ip)",       # [v5]
+    "CREATE INDEX IF NOT EXISTS FOR (n:Session) ON (n.dest_ip)",
     "CREATE INDEX IF NOT EXISTS FOR (n:Session) ON (n.flow_start)",
     "CREATE INDEX IF NOT EXISTS FOR (n:Session) ON (n.conn_state)",
     "CREATE INDEX IF NOT EXISTS FOR (n:Session) ON (n.tls_sni)",
@@ -319,47 +389,65 @@ def create_indexes(**ctx) -> None:
     logger.info("create_indexes 완료")
 
 
-# ── Task 6 : report_stats ─────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Task 6 : report_stats
+# ══════════════════════════════════════════════════════════════════════════════
 
 def report_stats(**ctx) -> None:
     ti             = ctx["ti"]
     session_count  = ti.xcom_pull(task_ids="load_sessions",  key="session_count")
     entity_count   = ti.xcom_pull(task_ids="load_entities",  key="entity_count")
     relation_count = ti.xcom_pull(task_ids="load_relations", key="relation_count")
+    session_key    = ti.xcom_pull(task_ids="load_sessions",  key="session_key")
 
     driver = _neo4j_driver()
     node_counts: dict[str, int] = {}
     rel_counts:  dict[str, int] = {}
-
     with driver.session() as neo_sess:
-        for label in ["Session","IP","Domain","Alert","Cipher"]:
-            node_counts[label] = neo_sess.run(f"MATCH (n:{label}) RETURN count(n) AS cnt").single()["cnt"]
-        for rel in ["CONNECTED_TO","ORIGINATED_FROM","REQUESTED","RESOLVED_BY","TRIGGERED","SERVED_OVER_TLS","ENCRYPTED_WITH"]:
-            rel_counts[rel] = neo_sess.run(f"MATCH ()-[r:{rel}]->() RETURN count(r) AS cnt").single()["cnt"]
-        threat_cnt = neo_sess.run("MATCH (s:Session {is_threat:true}) RETURN count(s) AS cnt").single()["cnt"]
-        tls_cnt    = neo_sess.run("MATCH (s:Session) WHERE s.tls_sni IS NOT NULL RETURN count(s) AS cnt").single()["cnt"]
-        uid_cnt    = neo_sess.run("MATCH (s:Session) WHERE s.uid IS NOT NULL RETURN count(s) AS cnt").single()["cnt"]  # [신규 v5]
-
+        for label in ["Session", "IP", "Domain", "Alert", "Cipher"]:
+            node_counts[label] = neo_sess.run(
+                f"MATCH (n:{label}) RETURN count(n) AS cnt"
+            ).single()["cnt"]
+        for rel in ["CONNECTED_TO", "ORIGINATED_FROM", "REQUESTED", "RESOLVED_BY",
+                    "TRIGGERED", "SERVED_OVER_TLS", "ENCRYPTED_WITH"]:
+            rel_counts[rel] = neo_sess.run(
+                f"MATCH ()-[r:{rel}]->() RETURN count(r) AS cnt"
+            ).single()["cnt"]
+        threat_cnt = neo_sess.run(
+            "MATCH (s:Session {is_threat:true}) RETURN count(s) AS cnt"
+        ).single()["cnt"]
+        tls_cnt = neo_sess.run(
+            "MATCH (s:Session) WHERE s.tls_sni IS NOT NULL RETURN count(s) AS cnt"
+        ).single()["cnt"]
+        uid_cnt = neo_sess.run(
+            "MATCH (s:Session) WHERE s.uid IS NOT NULL RETURN count(s) AS cnt"
+        ).single()["cnt"]
     driver.close()
 
     logger.info("=" * 70)
-    logger.info("▶ gold_to_neo4j 파이프라인 완료 요약 (v5 — uid 포함)")
+    logger.info("▶ gold_to_neo4j 파이프라인 완료 요약 (v6 — parquet 전환)")
     logger.info("=" * 70)
-    logger.info("  [적재 건수] session:%s entity:%s relation:%s", session_count, entity_count, relation_count)
+    logger.info("  [소스]  session_gold parquet   : s3://%s/%s", S3_BUCKET, session_key)
+    logger.info("  [적재]  session:%s  entity:%s  relation:%s",
+                session_count, entity_count, relation_count)
     logger.info("  [노드 합계] %d", sum(node_counts.values()))
-    for label, cnt in node_counts.items(): logger.info("      ├ :%-10s %d", label, cnt)
+    for label, cnt in node_counts.items():
+        logger.info("      ├ :%-10s %d", label, cnt)
     logger.info("  [관계 합계] %d", sum(rel_counts.values()))
-    for rel, cnt in rel_counts.items(): logger.info("      ├ %-25s %d", rel, cnt)
-    logger.info("  [위협 세션] %d / %d (%.1f%%)", threat_cnt, node_counts.get("Session",1),
-                100*threat_cnt/max(node_counts.get("Session",1),1))
-    logger.info("  [TLS 세션]  %d / %d (%.1f%%)", tls_cnt, node_counts.get("Session",1),
-                100*tls_cnt/max(node_counts.get("Session",1),1))
-    logger.info("  [uid 보유]  %d / %d (%.1f%%)", uid_cnt, node_counts.get("Session",1),
-                100*uid_cnt/max(node_counts.get("Session",1),1))
+    for rel, cnt in rel_counts.items():
+        logger.info("      ├ %-25s %d", rel, cnt)
+    logger.info("  [위협 세션] %d / %d (%.1f%%)", threat_cnt, node_counts.get("Session", 1),
+                100 * threat_cnt / max(node_counts.get("Session", 1), 1))
+    logger.info("  [TLS 세션]  %d / %d (%.1f%%)", tls_cnt, node_counts.get("Session", 1),
+                100 * tls_cnt / max(node_counts.get("Session", 1), 1))
+    logger.info("  [uid 보유]  %d / %d (%.1f%%)", uid_cnt, node_counts.get("Session", 1),
+                100 * uid_cnt / max(node_counts.get("Session", 1), 1))
     logger.info("=" * 70)
 
 
-# ── DAG 정의 ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# DAG 정의
+# ══════════════════════════════════════════════════════════════════════════════
 
 default_args = {
     "owner":            "linda",
@@ -371,7 +459,7 @@ default_args = {
 
 with DAG(
     dag_id="gold_to_neo4j",
-    description="Gold JSONL (S3) → Neo4j 그래프 적재 v5 (uid / dest_* / clear on/off)",
+    description="Gold parquet (S3) → Neo4j 그래프 적재 v6 (parquet 전환 / XCom 연동)",
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
     schedule=[GOLD_SESSION_ASSET, GOLD_ENTITY_ASSET, GOLD_RELATION_ASSET],
@@ -380,11 +468,11 @@ with DAG(
     tags=["cti", "graph-rag", "neo4j"],
 ) as dag:
 
-    t_clear    = PythonOperator(task_id="clear_graph",    python_callable=clear_graph)
-    t_sessions = PythonOperator(task_id="load_sessions",  python_callable=load_sessions)
-    t_entities = PythonOperator(task_id="load_entities",  python_callable=load_entities)
-    t_relations= PythonOperator(task_id="load_relations", python_callable=load_relations)
-    t_indexes  = PythonOperator(task_id="create_indexes", python_callable=create_indexes)
-    t_report   = PythonOperator(task_id="report_stats",   python_callable=report_stats)
+    t_clear     = PythonOperator(task_id="clear_graph",    python_callable=clear_graph)
+    t_sessions  = PythonOperator(task_id="load_sessions",  python_callable=load_sessions)
+    t_entities  = PythonOperator(task_id="load_entities",  python_callable=load_entities)
+    t_relations = PythonOperator(task_id="load_relations", python_callable=load_relations)
+    t_indexes   = PythonOperator(task_id="create_indexes", python_callable=create_indexes)
+    t_report    = PythonOperator(task_id="report_stats",   python_callable=report_stats)
 
     t_clear >> t_sessions >> t_entities >> t_relations >> t_indexes >> t_report
