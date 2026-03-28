@@ -193,8 +193,10 @@ def _load_silver_records(ctx) -> list[dict]:
     keys   = _list_silver_parquet_keys(prefix)
 
     if not keys:
-        logger.warning("해당 minute_10 prefix 에 parquet 없음 — 전체 silver prefix 로 fallback")
-        keys = _list_silver_parquet_keys()
+        # logger.warning("해당 minute_10 prefix 에 parquet 없음 — 전체 silver prefix 로 fallback")
+        # keys = _list_silver_parquet_keys()
+        # wait_for_silver 통과 후 여기 오면 안 됨 — 에러로 처리
+        raise ValueError(f"silver parquet 없음 — prefix: {prefix}")
 
     s3 = _s3_client()
     frames: list = []
@@ -811,11 +813,12 @@ with DAG(
     wait_for_silver = S3KeysUnchangedSensor(
         task_id="wait_for_silver",
         bucket_name=S3_BUCKET,
+        # 수정 — 템플릿 안에서 KST 변환
         prefix=(
             f"{S3_SILVER_PREFIX}"
-            "dt={{ logical_date.strftime('%Y-%m-%d') }}"
-            "/hour={{ logical_date.strftime('%H') }}"
-            "/minute_10={{ '%02d' % ((logical_date.minute // 10) * 10) }}/"
+            "dt={{ (logical_date + macros.timedelta(hours=9)).strftime('%Y-%m-%d') }}"
+            "/hour={{ (logical_date + macros.timedelta(hours=9)).strftime('%H') }}"
+            "/minute_10={{ '%02d' % (((logical_date + macros.timedelta(hours=9)).minute // 10) * 10) }}/"
         ),
         poke_interval=60,
         inactivity_period=300,
