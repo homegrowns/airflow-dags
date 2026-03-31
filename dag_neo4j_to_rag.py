@@ -837,7 +837,7 @@ def run_rag_analysis(**ctx) -> None:
     inference_dt = _now_kst_iso()
 
     def _fix_json_escapes(raw: str) -> str:
-        """LLM이 \x00 같은 invalid JSON escape를 뱉을 때 \u00xx로 치환."""
+        r"""LLM이 \x00 같은 invalid JSON escape를 뱉을 때 \u00xx로 치환."""
         return re.sub(r'\\x([0-9a-fA-F]{2})', lambda m: f'\\u00{m.group(1)}', raw)
 
     def _parse_response(raw: str, suspicion_score: int = 0) -> dict:
