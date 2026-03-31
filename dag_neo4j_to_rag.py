@@ -59,6 +59,7 @@ NEO4J_BATCH_SIZE   = 50
 GROQ_RPM_SLEEP     = 2.0
 MAX_SESSIONS       = 200
 GROQ_MODEL_DEFAULT = "llama-3.3-70b-versatile"
+GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -182,24 +183,119 @@ WHITELIST_IPS: set[str] = {
 WHITELIST_CIDRS: list[str] = ["10.0.2.0/24"]
 SUSPICION_THRESHOLD = 30
 
-_CATEGORY_TO_CLASSTYPE: dict[str, str] = {
-    "Web Application Attack":                        "web-application-attack",
-    "A Network Trojan was detected":                 "trojan-activity",
-    "Misc Attack":                                   "misc-attack",
-    "Potentially Bad Traffic":                       "bad-unknown",
-    "Detection of a Network Scan":                   "network-scan",
-    "Not Suspicious Traffic":                        "not-suspicious",
-    "Attempted Administrator Privilege Gain":        "misc-attack",
-    "Attempted User Privilege Gain":                 "misc-attack",
-    "Generic Protocol Command Decode":               "bad-unknown",
-    "Unknown Traffic":                               "unknown",
-    "Malware Command and Control Activity Detected": "command-and-control",
+# ── classtype → threat_score 기준점 매핑 (우선순위 기반) ─────────────────────
+CATEGORY_TO_CLASSTYPE: dict[str, str] = {
+    # ── priority 1 (고위협) ──────────────────────────────────────────────────
+    "Web Application Attack":                          "web-application-attack",
+    "A Network Trojan was detected":                   "trojan-activity",
+    "Malware Command and Control Activity Detected":   "command-and-control",
+    "Domain Observed Used for C2 Detected":            "domain-c2",
+    "Exploit Kit Activity Detected":                   "exploit-kit",
+    "Executable code was detected":                    "shellcode-detect",
+    "Targeted Malicious Activity was Detected":        "targeted-activity",
+    "Attempted Administrator Privilege Gain":          "attempted-admin",
+    "Successful Administrator Privilege Gain":         "successful-admin",
+    "Attempted User Privilege Gain":                   "attempted-user",
+    "Unsuccessful User Privilege Gain":                "unsuccessful-user",
+    "Successful User Privilege Gain":                  "successful-user",
+    "Successful Credential Theft Detected":            "credential-theft",
+    "Potential Corporate Privacy Violation":           "policy-violation",
+    "Inappropriate Content was Detected":              "inappropriate-content",
+    # ── priority 2 (중위협) ──────────────────────────────────────────────────
+    "Misc Attack":                                     "misc-attack",
+    "Potentially Bad Traffic":                         "bad-unknown",
+    "Attempted Denial of Service":                     "attempted-dos",
+    "Denial of Service":                               "successful-dos",
+    "Detection of a Denial of Service Attack":         "denial-of-service",
+    "Attempted Information Leak":                      "attempted-recon",
+    "Information Leak":                                "successful-recon-limited",
+    "Large Scale Information Leak":                    "successful-recon-largescale",
+    "A suspicious string was detected":                "string-detect",
+    "A suspicious filename was detected":              "suspicious-filename-detect",
+    "An attempted login using a suspicious username was detected": "suspicious-login",
+    "Attempt to login by a default username and password":         "default-login-attempt",
+    "A client was using an unusual port":              "unusual-client-port-connection",
+    "Detection of a non-standard protocol or event":   "non-standard-protocol",
+    "Device Retrieving External IP Address Detected":  "external-ip-check",
+    "access to a potentially vulnerable web application": "web-application-activity",
+    "Possible Social Engineering Attempted":           "social-engineering",
+    "Crypto Currency Mining Activity Detected":        "coin-mining",
+    "Possibly Unwanted Program Detected":              "pup-activity",
+    "Decode of an RPC Query":                          "rpc-portmap-decode",
+    "A system call was detected":                      "system-call-detect",
+    # ── priority 3 (저위협/정보성) ───────────────────────────────────────────
+    "Not Suspicious Traffic":                          "not-suspicious",
+    "Unknown Traffic":                                 "unknown",
+    "Misc activity":                                   "misc-activity",
+    "Generic ICMP event":                              "icmp-event",
+    "Generic Protocol Command Decode":                 "protocol-command-decode",
+    "Detection of a Network Scan":                     "network-scan",
+    # ── priority 4 ──────────────────────────────────────────────────────────
+    "A TCP connection was detected":                   "tcp-connection",
+}
+
+# classtype별 threat_score 기준 범위 (LLM fallback 및 검증용)
+CLASSTYPE_SCORE_RANGE: dict[str, tuple[int, int]] = {
+    "web-application-attack":       (70, 95),
+    "trojan-activity":              (75, 95),
+    "command-and-control":          (80, 100),
+    "domain-c2":                    (80, 100),
+    "exploit-kit":                  (75, 95),
+    "shellcode-detect":             (75, 95),
+    "targeted-activity":            (70, 95),
+    "attempted-admin":              (65, 90),
+    "successful-admin":             (85, 100),
+    "attempted-user":               (60, 85),
+    "unsuccessful-user":            (55, 80),
+    "successful-user":              (70, 90),
+    "credential-theft":             (80, 100),
+    "policy-violation":             (60, 85),
+    "inappropriate-content":        (50, 75),
+    "misc-attack":                  (45, 70),
+    "bad-unknown":                  (40, 65),
+    "attempted-dos":                (55, 80),
+    "successful-dos":               (65, 85),
+    "denial-of-service":            (60, 85),
+    "attempted-recon":              (40, 65),
+    "successful-recon-limited":     (45, 65),
+    "successful-recon-largescale":  (55, 75),
+    "string-detect":                (35, 60),
+    "suspicious-filename-detect":   (45, 70),
+    "suspicious-login":             (45, 70),
+    "default-login-attempt":        (45, 70),
+    "unusual-client-port-connection": (35, 60),
+    "non-standard-protocol":        (35, 60),
+    "external-ip-check":            (30, 55),
+    "web-application-activity":     (30, 55),
+    "social-engineering":           (50, 75),
+    "coin-mining":                  (50, 70),
+    "pup-activity":                 (25, 50),
+    "rpc-portmap-decode":           (25, 50),
+    "system-call-detect":           (40, 65),
+    "not-suspicious":               (5,  25),
+    "unknown":                      (20, 45),
+    "misc-activity":                (10, 35),
+    "icmp-event":                   (10, 30),
+    "protocol-command-decode":      (10, 30),
+    "network-scan":                 (35, 60),
+    "tcp-connection":               (5,  20),
 }
 _CLASSTYPE_RANK: dict[str, int] = {
+    # priority 1 고위협
     "web-application-attack": 3, "trojan-activity": 3,
-    "command-and-control": 3,   "misc-attack": 3,
-    "bad-unknown": 2,           "network-scan": 2,
-    "not-suspicious": 1,        "unknown": 1,
+    "command-and-control": 3,    "misc-attack": 3,
+    "exploit-kit": 3,            "shellcode-detect": 3,
+    "targeted-activity": 3,      "attempted-admin": 3,
+    "successful-admin": 3,       "credential-theft": 3,
+    "domain-c2": 3,              "successful-user": 3,
+    "attempted-user": 3,         "policy-violation": 3,
+    # priority 2 중위협
+    "bad-unknown": 2,            "network-scan": 2,
+    "attempted-dos": 2,          "denial-of-service": 2,
+    "coin-mining": 2,            "social-engineering": 2,
+    # priority 3 저위협
+    "not-suspicious": 1,         "unknown": 1,
+    "tcp-connection": 1,         "misc-activity": 1,
 }
 
 
@@ -287,7 +383,7 @@ def _calc_suspicion_score(session: dict, repeat_count: int = 1) -> int:
     severities: list[int] = []
     for ev in session.get("timeline", []):
         if ev.get("source") != "suricata" or not ev.get("signature"): continue
-        ct = _CATEGORY_TO_CLASSTYPE.get(ev.get("category", ""), "unknown")
+        ct = CATEGORY_TO_CLASSTYPE.get(ev.get("category", ""), "unknown")
         classtypes.append(ct)
         sev = ev.get("severity")
         if sev is not None:
@@ -298,10 +394,20 @@ def _calc_suspicion_score(session: dict, repeat_count: int = 1) -> int:
     highest_sev = min(severities) if severities else 4
 
     def _ct_score(ct: str) -> int:
-        if ct in {"web-application-attack","trojan-activity","command-and-control","misc-attack"}: return 30
-        if ct in {"bad-unknown","network-scan"}:  return 20
-        if ct in {"not-suspicious","unknown"}:    return 10
-        return 0
+        HIGH = {
+            "web-application-attack", "trojan-activity", "command-and-control",
+            "misc-attack", "exploit-kit", "shellcode-detect", "targeted-activity",
+            "attempted-admin", "successful-admin", "credential-theft", "domain-c2",
+        }
+        MID = {
+            "bad-unknown", "network-scan", "attempted-user", "successful-user",
+            "policy-violation", "attempted-dos", "denial-of-service",
+            "coin-mining", "social-engineering",
+        }
+        if ct in HIGH: return 30
+        if ct in MID:  return 20
+        if ct in {"not-suspicious", "unknown", "tcp-connection"}: return 5
+        return 10
 
     def _sev_score(s: int) -> int:
         return {1: 30, 2: 20, 3: 10}.get(s, 0)
@@ -574,6 +680,11 @@ def build_subgraphs(**ctx) -> None:
 
 def _subgraph_to_text(subgraph: dict) -> str:
     s = subgraph["session"]
+    # timeline에서 suricata alert 추출
+    alerts = [
+        ev for ev in s.get("timeline", [])
+        if ev.get("source") == "suricata" and ev.get("signature")
+    ]
     lines = [
         "[현재 세션 정보]",
         f"  session_id   : {s.get('session_id')}",
@@ -589,6 +700,17 @@ def _subgraph_to_text(subgraph: dict) -> str:
         f"  flow_start   : {s.get('flow_start')}",
         "",
     ]
+    # 추가: suricata alert 목록
+    if alerts:
+        lines.append("[Suricata Alerts]")
+        for av in alerts:
+            lines.append(
+                f"  severity={av.get('severity')}  "
+                f"category={av.get('category') or 'N/A'}  "
+                f"signature={av.get('signature')}"
+            )
+        lines.append("")
+
     neighbors = subgraph.get("neighbors", [])
     if neighbors:
         lines.append("[Neo4j 과거 행위 (1-hop)]")
@@ -602,6 +724,20 @@ def _subgraph_to_text(subgraph: dict) -> str:
     else:
         lines.append("[Neo4j 과거 행위] 없음 (신규 세션 또는 미수집)")
     return "\n".join(lines)
+
+
+# ── threat_score 산정 가중치 ──────────────────────────────────────────────────
+# LLM이 아래 기준을 참고해 기준 범위 안에서 최종 점수를 결정함
+#
+#  기준값 = classtype별 범위 중간값
+#  +10  : max_severity == 1
+#  + 5  : alert_count >= 3
+#  + 5  : conn_state in (RSTO, RSTR, S0)  → 비정상 종료/연결 미완
+#  + 5  : src_ip가 공인 IP이고 dest_ip가 내부망(10./172.16-31./192.168.)
+#  + 8  : Neo4j related_session_count >= 50  → 동일 IP 반복 다발
+#  + 5  : Neo4j related_session_count >= 10
+#  -10  : not-suspicious / tcp-connection / misc-activity classtype
+#  범위 상한/하한을 벗어나지 않도록 클램프
 
 
 _SYSTEM_PROMPT = """\
@@ -629,9 +765,53 @@ When writing the summary, you MUST analyze and reference ALL of the following fi
 - conn_state           : 연결 완료 여부 (S0=연결 시도만, SF=정상 완료, REJ=포트닫힘, RSTO/RSTR=강제종료, OTH=터널링의심 등)
 - Neo4j 과거 행위      : 동일 세션의 과거 관계(엣지 타입, 연결 노드)에서 반복·지속 패턴 여부
 
+THREAT SCORE RULES (STRICT):
+threat_score는 0~100 사이 정수이며, 아래 기준에 따라 산정할 것.
+
+1. threat_type에 따른 기준 범위 (이 범위를 절대 벗어나지 말 것):
+   - Web Application Attack                       : 70~95
+   - A Network Trojan was detected                : 75~95
+   - Malware Command and Control Activity Detected: 80~100
+   - Domain Observed Used for C2 Detected         : 80~100
+   - Exploit Kit Activity Detected                : 75~95
+   - Executable code was detected                 : 75~95
+   - Targeted Malicious Activity was Detected     : 70~95
+   - Attempted Administrator Privilege Gain       : 65~90
+   - Successful Administrator Privilege Gain      : 85~100
+   - Attempted User Privilege Gain                : 60~85
+   - Successful User Privilege Gain               : 70~90
+   - Successful Credential Theft Detected         : 80~100
+   - Potential Corporate Privacy Violation        : 60~85
+   - Misc Attack                                  : 45~70
+   - Potentially Bad Traffic                      : 40~65
+   - Attempted Denial of Service                  : 55~80
+   - Detection of a Denial of Service Attack      : 60~85
+   - Attempted Information Leak                   : 40~65
+   - A suspicious filename was detected           : 45~70
+   - An attempted login using a suspicious username was detected: 45~70
+   - Attempt to login by a default username and password: 45~70
+   - Detection of a Network Scan                  : 35~60
+   - Crypto Currency Mining Activity Detected     : 50~70
+   - Not Suspicious Traffic                       : 5~25
+   - Unknown Traffic                              : 20~45
+   - Generic Protocol Command Decode              : 10~30
+   - A TCP connection was detected                : 5~20
+
+2. 기준 범위 안에서 아래 가중치를 적용해 최종 점수를 결정할 것:
+   +10 : max_severity == 1
+   + 5 : alert_count >= 3
+   + 5 : conn_state가 RSTO, RSTR, S0 중 하나 (비정상 종료/연결 미완)
+   + 5 : src_ip가 공인 IP이고 dest_ip가 내부망 대역 (10.x, 172.16~31.x, 192.168.x)
+   + 8 : Neo4j에서 동일 src_ip의 related_session_count >= 50 (반복 다발 공격)
+   + 5 : Neo4j에서 동일 src_ip의 related_session_count >= 10
+
+3. 가중치 합산 후에도 반드시 해당 threat_type의 범위 내로 클램프할 것.
+   예) Web Application Attack 기준 82점 + 가중치 15 = 97 → 상한 95로 클램프
+
 Analyze and respond ONLY in this JSON format (no markdown, no explanation):
 {
-  "threat_type": "<Web Application Attack | A Network Trojan was detected | Misc Attack | Potentially Bad Traffic | Detection of a Network Scan | Not Suspicious Traffic | Attempted Administrator Privilege Gain | Attempted User Privilege Gain | Generic Protocol Command Decode | Malware Command and Control Activity Detected | Unknown Traffic>",
+  "threat_type": "<Web Application Attack | A Network Trojan was detected | Malware Command and Control Activity Detected | Domain Observed Used for C2 Detected | Exploit Kit Activity Detected | Executable code was detected | Targeted Malicious Activity was Detected | Attempted Administrator Privilege Gain | Successful Administrator Privilege Gain | Attempted User Privilege Gain | Unsuccessful User Privilege Gain | Successful User Privilege Gain | Successful Credential Theft Detected | Potential Corporate Privacy Violation | Inappropriate Content was Detected | Misc Attack | Potentially Bad Traffic | Attempted Denial of Service | Denial of Service | Detection of a Denial of Service Attack | Attempted Information Leak | Information Leak | Large Scale Information Leak | A suspicious string was detected | A suspicious filename was detected | An attempted login using a suspicious username was detected | Attempt to login by a default username and password | A client was using an unusual port | Detection of a non-standard protocol or event | Device Retrieving External IP Address Detected | access to a potentially vulnerable web application | Possible Social Engineering Attempted | Crypto Currency Mining Activity Detected | Possibly Unwanted Program Detected | Decode of an RPC Query | A system call was detected | Not Suspicious Traffic | Unknown Traffic | Misc activity | Generic ICMP event | Generic Protocol Command Decode | Detection of a Network Scan | A TCP connection was detected>",
+  "threat_score": <0~100 정수. 위 THREAT SCORE RULES에 따라 산정>,
   "summary": "<2~3문장 한국어 위협 요약. 반드시 개조식(~임. ~됨. ~필요.) 한국어로만 작성. 위 필드 중 실제로 존재하는 값을 구체적으로 인용하여 판단 근거를 서술할 것. N/A이거나 없는 필드는 언급하지 말 것>",
   "recommended_action": "<한 줄 대응 권고>"
 }
@@ -656,35 +836,56 @@ def run_rag_analysis(**ctx) -> None:
     use_fallback = False
     inference_dt = _now_kst_iso()
 
-    def _parse_response(raw: str) -> dict:
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            cleaned = raw.replace("```json", "").replace("```", "").strip()
+    def _fix_json_escapes(raw: str) -> str:
+        """LLM이 \x00 같은 invalid JSON escape를 뱉을 때 \u00xx로 치환."""
+        return re.sub(r'\\x([0-9a-fA-F]{2})', lambda m: f'\\u00{m.group(1)}', raw)
+
+    def _parse_response(raw: str, suspicion_score: int = 0) -> dict:
+        # 1차 시도: 그대로 파싱
+        for text in (raw, raw.replace("```json", "").replace("```", "").strip()):
             try:
-                return json.loads(cleaned)
+                result = json.loads(text)
+                # threat_score가 LLM 응답에 없으면 suspicion_score로 fallback
+                if "threat_score" not in result:
+                    result["threat_score"] = max(0, min(100, int(suspicion_score)))
+                return result
             except json.JSONDecodeError:
-                return {"raw_response": raw, "parse_error": True}
+                pass
+
+        # 2차 시도: \x escape 교정 후 재시도
+        fixed = _fix_json_escapes(raw)
+        try:
+            result = json.loads(fixed)
+            if "threat_score" not in result:
+                result["threat_score"] = max(0, min(100, int(suspicion_score)))
+            return result
+        except json.JSONDecodeError:
+            pass
+
+        # 최종 fallback
+        return {
+            "parse_error": True,
+            "raw_response": raw,
+            "threat_score": max(0, min(100, int(suspicion_score))),
+        }
 
     def _append_result(response, session_id: str, sg: dict) -> None:
-        raw      = response.choices[0].message.content.strip()
-        analysis = _parse_response(raw)
+        raw             = response.choices[0].message.content.strip()
+        suspicion_score = sg["session"].get("suspicion_score", 0)
+        analysis        = _parse_response(raw, suspicion_score)  # suspicion_score 전달
         results.append({
             "session_id":         session_id,
             "uid":                sg["session"].get("uid"),
             "inference_datetime": inference_dt,
             "session":            sg["session"],
-            "analysis": {
-                **analysis,
-                "threat_score": sg["session"].get("suspicion_score", 0),
-            },
-            "neighbors": sg.get("neighbors", []),
+            "analysis":           analysis,   # ← 덮어쓰기 제거, LLM 점수 그대로 사용
+            "neighbors":          sg.get("neighbors", []),
         })
 
     for i, sg in enumerate(subgraphs):
         session_id    = sg["session"].get("session_id", f"unknown_{i}")
         user_text     = _subgraph_to_text(sg)
-        current_model = "openai/gpt-oss-120b" if use_fallback else model
+        current_model = GROQ_FALLBACK_MODEL if use_fallback else model
 
         try:
             response = groq.chat.completions.create(
