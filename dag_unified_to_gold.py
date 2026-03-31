@@ -118,12 +118,16 @@ def _gold_s3_key(table: str, execution_date: datetime) -> str:
 
 
 def _silver_sensor_prefix(execution_date: datetime) -> str:
-    """KST 기준 silver prefix."""
-    kst       = _to_kst(execution_date)
-    dt        = kst.strftime("%Y-%m-%d")
-    hour      = kst.strftime("%H")
-    minute_10 = f"{(kst.minute // 10) * 10:02d}"
-    return f"{S3_SILVER_PREFIX}dt={dt}/hour={hour}/minute_10={minute_10}/"
+    # ── 임시 테스트용 override ─────────────────────────────
+    TEST_PREFIX = "silver/common_records/dt=2026-03-29/hour=03/minute_10=50/"
+    logger.warning("_silver_sensor_prefix: TEST_PREFIX override — %s", TEST_PREFIX)
+    return TEST_PREFIX
+    # """KST 기준 silver prefix."""
+    # kst       = _to_kst(execution_date)
+    # dt        = kst.strftime("%Y-%m-%d")
+    # hour      = kst.strftime("%H")
+    # minute_10 = f"{(kst.minute // 10) * 10:02d}"
+    # return f"{S3_SILVER_PREFIX}dt={dt}/hour={hour}/minute_10={minute_10}/"
 
 
 def _next_silver_prefix(execution_date: datetime) -> str:
@@ -529,6 +533,7 @@ def extract_sessions(**ctx) -> None:
             "alert_count":    suri["alert_count"],
             "max_severity":   suri["max_severity"],
             "is_threat":      session.get("is_threat", False),
+            "timeline":     json.dumps(timeline, ensure_ascii=False),
             "flow_state":     suri["flow_state"],
             "flow_reason":    suri["flow_reason"],
             "pkts_toserver":  suri["pkts_toserver"],
