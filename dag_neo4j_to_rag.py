@@ -80,7 +80,7 @@ def _neo4j_driver():
 
 def _groq_client():
     from groq import Groq
-    return Groq(api_key=Variable.get("GROQ_API_KEY"), max_retries=2, timeout=30.0)
+    return Groq(api_key=Variable.get("GROQ_API_KEY"), max_retries=1, timeout=10.0)
 
 
 def _groq_model() -> str:
