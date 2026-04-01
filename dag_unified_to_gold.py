@@ -136,26 +136,9 @@ _TEST_PREFIXES = [
 
 def _silver_sensor_prefix(execution_date: datetime) -> str:
     # ── 임시 테스트용 override ─────────────────────────────
-    # backfill CLI로 20개 순차 실행 시 logical_date 기반으로 인덱스 결정
-    import bisect
-    from datetime import datetime as dt
-    anchors = [
-        dt(2026, 3, 26, 20, 40), dt(2026, 3, 26, 20, 50),
-        dt(2026, 3, 26, 21,  0), dt(2026, 3, 26, 21, 10),
-        dt(2026, 3, 26, 21, 20), dt(2026, 3, 26, 21, 30),
-        dt(2026, 3, 26, 21, 40), dt(2026, 3, 26, 21, 50),
-        dt(2026, 3, 26, 22,  0), dt(2026, 3, 26, 22, 10),
-        dt(2026, 3, 26, 22, 20), dt(2026, 3, 26, 22, 30),
-        dt(2026, 3, 26, 22, 40), dt(2026, 3, 26, 22, 50),
-        dt(2026, 3, 26, 23,  0), dt(2026, 3, 26, 23, 10),
-        dt(2026, 3, 26, 23, 20), dt(2026, 3, 26, 23, 30),
-        dt(2026, 3, 26, 23, 40), dt(2026, 3, 26, 23, 50),
-    ]
-    naive = execution_date.replace(tzinfo=None) if execution_date.tzinfo else execution_date
-    idx   = min(bisect.bisect_right(anchors, naive), len(_TEST_PREFIXES) - 1)
-    prefix = _TEST_PREFIXES[idx]
-    logger.warning("_silver_sensor_prefix: TEST override [%d] — %s", idx, prefix)
-    return prefix
+    TEST_PREFIX = "silver/common_records/dt=2026-03-29/hour=03/minute_10=50/"
+    logger.warning("_silver_sensor_prefix: TEST_PREFIX override — %s", TEST_PREFIX)
+    return TEST_PREFIX
     # ── 테스트 끝나면 제거 ────────────────────────────────
     # """KST 기준 silver prefix."""
     # kst       = _to_kst(execution_date)
@@ -568,7 +551,7 @@ def extract_sessions(**ctx) -> None:
             "alert_count":    suri["alert_count"],
             "max_severity":   suri["max_severity"],
             "is_threat":      session.get("is_threat", False),
-            "timeline":     json.dumps(timeline, ensure_ascii=False),
+            "timeline":       json.dumps(timeline, ensure_ascii=False),
             "flow_state":     suri["flow_state"],
             "flow_reason":    suri["flow_reason"],
             "pkts_toserver":  suri["pkts_toserver"],
