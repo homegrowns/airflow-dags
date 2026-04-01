@@ -116,24 +116,6 @@ def _gold_s3_key(table: str, execution_date: datetime) -> str:
         f"/minute_10={minute_10}_{table}.parquet"
     )
 
-_TEST_PREFIXES = [
-    "silver/common_records/dt=2026-03-28/hour=21/minute_10=30/",
-    "silver/common_records/dt=2026-03-28/hour=21/minute_10=40/",
-    "silver/common_records/dt=2026-03-28/hour=21/minute_10=50/",
-    "silver/common_records/dt=2026-03-28/hour=22/minute_10=00/",
-    "silver/common_records/dt=2026-03-28/hour=22/minute_10=10/",
-    "silver/common_records/dt=2026-03-28/hour=22/minute_10=20/",
-    "silver/common_records/dt=2026-03-28/hour=22/minute_10=30/",
-    "silver/common_records/dt=2026-03-28/hour=22/minute_10=40/",
-    "silver/common_records/dt=2026-03-28/hour=22/minute_10=50/",
-    "silver/common_records/dt=2026-03-28/hour=23/minute_10=00/",
-    "silver/common_records/dt=2026-03-28/hour=23/minute_10=10/",
-    "silver/common_records/dt=2026-03-28/hour=23/minute_10=20/",
-    "silver/common_records/dt=2026-03-28/hour=23/minute_10=30/",
-    "silver/common_records/dt=2026-03-28/hour=23/minute_10=40/",
-    "silver/common_records/dt=2026-03-28/hour=23/minute_10=50/",
-]
-
 def _silver_sensor_prefix(execution_date: datetime) -> str:
     # ── 임시 테스트용 override ─────────────────────────────
     TEST_PREFIX = "silver/common_records/dt=2026-03-29/hour=03/minute_10=50/"
@@ -149,19 +131,21 @@ def _silver_sensor_prefix(execution_date: datetime) -> str:
 
 
 def _next_silver_prefix(execution_date: datetime) -> str:
-    """현재 배치의 다음 minute_10 silver prefix (KST 기준)."""
-    kst          = _to_kst(execution_date)
-    next_minute  = ((kst.minute // 10) + 1) * 10
+     # ── 임시: 이미 존재하는 경로로 고정 ──────────────────
+    return "silver/common_records/dt=2026-03-29/hour=04/minute_10=00/"
+    # """현재 배치의 다음 minute_10 silver prefix (KST 기준)."""
+    # kst          = _to_kst(execution_date)
+    # next_minute  = ((kst.minute // 10) + 1) * 10
 
-    if next_minute >= 60:
-        next_kst    = kst.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-        next_minute = 0
-    else:
-        next_kst = kst
+    # if next_minute >= 60:
+    #     next_kst    = kst.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    #     next_minute = 0
+    # else:
+    #     next_kst = kst
 
-    dt        = next_kst.strftime("%Y-%m-%d")
-    hour      = next_kst.strftime("%H")
-    return f"{S3_SILVER_PREFIX}dt={dt}/hour={hour}/minute_10={next_minute:02d}/"
+    # dt        = next_kst.strftime("%Y-%m-%d")
+    # hour      = next_kst.strftime("%H")
+    # return f"{S3_SILVER_PREFIX}dt={dt}/hour={hour}/minute_10={next_minute:02d}/"
 
 
 # ── parquet 읽기/쓰기 ─────────────────────────────────────────────────────────
