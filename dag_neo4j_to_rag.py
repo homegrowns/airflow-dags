@@ -41,6 +41,10 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+# import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor, Future
+
 import boto3
 from airflow import DAG
 from airflow.models import Variable
@@ -60,6 +64,10 @@ GROQ_RPM_SLEEP     = 2.0
 MAX_SESSIONS       = 200
 GROQ_MODEL_DEFAULT = "llama-3.3-70b-versatile"
 GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"
+
+# S3 스트리밍 write 설정
+S3_WRITE_WORKERS    = 2      # S3 업로드 스레드 수
+# S3_WRITE_QUEUE_SIZE = 50     # 큐 최대 크기 (추론 속도가 write보다 빠를 때 버퍼)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -173,6 +181,155 @@ def _build_rag_s3_key(partition: dict[str, str]) -> str:
     )
 
 
+class _S3StreamingWriter:
+    """
+    추론 결과를 받아 S3에 비동기로 append write하는 워커.
+ 
+    사용법:
+        writer = _S3StreamingWriter(s3_key)
+        writer.start()
+        writer.put(result_dict)   # 추론 완료마다 호출
+        count, errors = writer.finish()  # 모든 write 완료 대기
+    """
+ 
+    # _SENTINEL = object()  # 종료 신호
+ 
+    def __init__(self, s3_key: str):
+        self._s3_key   = s3_key
+        # self._queue: queue.Queue = queue.Queue(maxsize=S3_WRITE_QUEUE_SIZE)
+        self._lines: list[str]   = []          # 최종 병합용 버퍼
+        self._lock                = threading.Lock()
+        self._write_errors: list[str] = []
+        self._checkpoint_keys: list[str] = []   # 삭제 대상 체크포인트 키 목록
+        self._executor = ThreadPoolExecutor(
+            max_workers=S3_WRITE_WORKERS,
+            thread_name_prefix="s3_rag_writer",
+        )
+        self._futures: list[Future] = []
+        # self._running = False
+ 
+    # ── public ──────────────────────────────────────────────────────────────
+ 
+    def start(self) -> None:
+        pass
+ 
+    def put(self, result: dict) -> None:
+        """추론 완료된 결과 1건을 큐에 넣고 즉시 S3 write 예약."""
+        line = json.dumps(result, ensure_ascii=False)
+        with self._lock:
+            self._lines.append(line)
+            f = self._executor.submit(self._write_single_line, line)
+            self._futures.append(f)
+ 
+    def finish(self) -> tuple[int, int]:
+        """
+        1) 모든 체크포인트 write future 완료 대기
+        2) 전체 lines를 단일 JSONL로 S3 최종 업로드 (순서 보장)
+        3) 체크포인트 파일 일괄 삭제
+        반환: (저장 건수, 오류 건수)
+        """
+        # future 목록 스냅샷 (이후 put() 호출 없음이 보장된 시점)
+        with self._lock:
+            futures_snapshot = list(self._futures)
+            
+        # 개별 write future 완료 대기 (오류 수집)
+        for f in futures_snapshot:
+            try:
+                f.result()
+            except Exception as e:
+                self._write_errors.append(str(e))
+ 
+        self._executor.shutdown(wait=True)
+ 
+        # 최종 단일 파일로 S3에 덮어쓰기 (병렬 write 결과를 순서 보장하여 통합)
+        with self._lock:
+            lines_snapshot = list(self._lines)
+ 
+        if lines_snapshot:
+            body = "\n".join(lines_snapshot)
+            try:
+                _s3_client().put_object(
+                    Bucket=S3_BUCKET,
+                    Key=self._s3_key,
+                    Body=body.encode("utf-8"),
+                    ContentType="application/jsonl",
+                )
+                logger.info(
+                    "_S3StreamingWriter.finish: s3://%s/%s → %d 건 최종 업로드",
+                    S3_BUCKET, self._s3_key, len(lines_snapshot),
+                )
+            except Exception as e:
+                logger.error("_S3StreamingWriter.finish: 최종 업로드 실패 — %s", e)
+                self._write_errors.append(str(e))
+                
+        # 체크포인트 파일 일괄 삭제
+        self._cleanup_checkpoints()
+        
+        return len(lines_snapshot), len(self._write_errors)
+ 
+    # ── private ─────────────────────────────────────────────────────────────
+ 
+    def _write_single_line(self, line: str) -> None:
+        """
+        개별 결과를 S3 체크포인트로 즉시 write.
+        실패해도 finish()의 최종 업로드가 백업.
+        성공 시 체크포인트 키를 _checkpoint_keys에 등록 (나중에 삭제).
+        """
+        ck_key = self._s3_key.replace(
+            "_rag_results.jsonl",
+            f"_checkpoint_{abs(hash(line)) % 100000:05d}.jsonl",
+        )
+        try:
+            _s3_client().put_object(
+                Bucket=S3_BUCKET,
+                Key=ck_key,
+                Body=(line + "\n").encode("utf-8"),
+                ContentType="application/jsonl",
+            )
+            # 성공한 체크포인트만 삭제 목록에 추가 — lock으로 보호
+            with self._lock:
+                self._checkpoint_keys.append(ck_key)
+        except Exception as e:
+            # 체크포인트 실패는 경고만 — finish()가 보장
+            logger.warning("_S3StreamingWriter._write_single_line 실패 — %s", e)
+            
+    def _cleanup_checkpoints(self) -> None:
+        """
+        S3 delete_objects API로 체크포인트 파일을 최대 1000개씩 배치 삭제.
+        실패해도 메인 파이프라인에 영향 없음.
+        """
+        with self._lock:
+            keys = list(self._checkpoint_keys)
+ 
+        if not keys:
+            return
+ 
+        s3 = _s3_client()
+        # S3 delete_objects: 한 번에 최대 1000개
+        BATCH = 1000
+        deleted_total = 0
+        for i in range(0, len(keys), BATCH):
+            batch = keys[i : i + BATCH]
+            try:
+                resp = s3.delete_objects(
+                    Bucket=S3_BUCKET,
+                    Delete={"Objects": [{"Key": k} for k in batch], "Quiet": True},
+                )
+                errors = resp.get("Errors", [])
+                deleted_total += len(batch) - len(errors)
+                for err in errors:
+                    logger.warning(
+                        "_cleanup_checkpoints: 삭제 실패 — key=%s code=%s",
+                        err.get("Key"), err.get("Code"),
+                    )
+            except Exception as e:
+                logger.warning("_cleanup_checkpoints: batch 삭제 오류 — %s", e)
+ 
+        logger.info(
+            "_cleanup_checkpoints: 체크포인트 %d/%d 건 삭제 완료",
+            deleted_total, len(keys),
+        )
+        
 # ══════════════════════════════════════════════════════════════════════════════
 # whitelist 로직
 # ══════════════════════════════════════════════════════════════════════════════
@@ -819,23 +976,47 @@ Analyze and respond ONLY in this JSON format (no markdown, no explanation):
 
 
 def run_rag_analysis(**ctx) -> None:
+    """
+    Groq RAG 추론 + S3 스트리밍 write 통합 태스크.
+ 
+    XCom 출력:
+      saved_s3_key       : S3 저장 경로
+      saved_count        : 저장 건수
+      inference_datetime : 추론 시작 KST
+      error_count        : 분석 실패 건수
+      threat_dist        : { threat_type: count } (report용)
+    """
     from groq import RateLimitError
 
     subgraphs: list[dict] = ctx["ti"].xcom_pull(
         task_ids="build_subgraphs", key="subgraphs"
     ) or []
-
+    
+    partition: dict = ctx["ti"].xcom_pull(
+        task_ids="load_session_gold", key="gold_partition"
+    ) or {}
+    
     if not subgraphs:
         logger.warning("run_rag_analysis: 처리할 서브그래프 없음")
-        ctx["ti"].xcom_push(key="rag_results", value=[])
+        ctx["ti"].xcom_push(key="saved_s3_key",       value="-")
+        ctx["ti"].xcom_push(key="saved_count",         value=0)
+        ctx["ti"].xcom_push(key="inference_datetime",  value=_now_kst_iso())
+        ctx["ti"].xcom_push(key="error_count",         value=0)
+        ctx["ti"].xcom_push(key="threat_dist",         value={})
         return
 
+    s3_key       = _build_rag_s3_key(partition)
+    writer       = _S3StreamingWriter(s3_key)
+    writer.start()
+    
     groq         = _groq_client()
     model        = _groq_model()
-    results:     list[dict] = []
+    # results:     list[dict] = []
     use_fallback = False
     inference_dt = _now_kst_iso()
-
+    error_count  = 0
+    threat_dist: dict[str, int] = {}
+    
     def _fix_json_escapes(raw: str) -> str:
         r"""LLM이 \x00 같은 invalid JSON escape를 뱉을 때 \u00xx로 치환."""
         return re.sub(r'\\x([0-9a-fA-F]{2})', lambda m: f'\\u00{m.group(1)}', raw)
@@ -869,18 +1050,44 @@ def run_rag_analysis(**ctx) -> None:
             "threat_score": max(0, min(100, int(suspicion_score))),
         }
 
-    def _append_result(response, session_id: str, sg: dict) -> None:
+    # def _append_result(response, session_id: str, sg: dict) -> None:
+    #     raw             = response.choices[0].message.content.strip()
+    #     suspicion_score = sg["session"].get("suspicion_score", 0)
+    #     analysis        = _parse_response(raw, suspicion_score)  # suspicion_score 전달
+    #     results.append({
+    #         "session_id":         session_id,
+    #         "uid":                sg["session"].get("uid"),
+    #         "inference_datetime": inference_dt,
+    #         "session":            sg["session"],
+    #         "analysis":           analysis,   # ← 덮어쓰기 제거, LLM 점수 그대로 사용
+    #         "neighbors":          sg.get("neighbors", []),
+    #     })
+
+    def _build_and_write(response, session_id: str, sg: dict) -> None:
+        """추론 결과 조립 → writer.put() → threat_dist 집계."""
+        nonlocal error_count
         raw             = response.choices[0].message.content.strip()
         suspicion_score = sg["session"].get("suspicion_score", 0)
-        analysis        = _parse_response(raw, suspicion_score)  # suspicion_score 전달
-        results.append({
+        analysis        = _parse_response(raw, suspicion_score)
+ 
+        record = {
             "session_id":         session_id,
             "uid":                sg["session"].get("uid"),
             "inference_datetime": inference_dt,
             "session":            sg["session"],
-            "analysis":           analysis,   # ← 덮어쓰기 제거, LLM 점수 그대로 사용
+            "analysis":           analysis,
             "neighbors":          sg.get("neighbors", []),
-        })
+        }
+ 
+        # XCom 없이 바로 S3 writer 큐에 삽입
+        writer.put(record)
+ 
+        # 통계 집계 (parse_error는 error로 카운트)
+        if analysis.get("parse_error") or analysis.get("error"):
+            error_count += 1
+        else:
+            tt = analysis.get("threat_type", "Unknown")
+            threat_dist[tt] = threat_dist.get(tt, 0) + 1
 
     for i, sg in enumerate(subgraphs):
         session_id    = sg["session"].get("session_id", f"unknown_{i}")
@@ -897,7 +1104,8 @@ def run_rag_analysis(**ctx) -> None:
                 temperature=0.1,
                 max_tokens=1024,
             )
-            _append_result(response, session_id, sg)
+            # _append_result(response, session_id, sg)
+            _build_and_write(response, session_id, sg)
 
         except RateLimitError:
             if not use_fallback:
@@ -922,97 +1130,77 @@ def run_rag_analysis(**ctx) -> None:
                     temperature=0.1,
                     max_tokens=1024,
                 )
-                _append_result(response, session_id, sg)
+                # _append_result(response, session_id, sg)
+                _build_and_write(response, session_id, sg)
+                
             except Exception as e2:
                 logger.error("run_rag_analysis: session_id=%s fallback 실패 — %s", session_id, e2)
-                results.append({
+                error_record = {
                     "session_id":         session_id,
                     "uid":                sg["session"].get("uid"),
                     "inference_datetime": inference_dt,
                     "session":            sg["session"],
                     "analysis":           {"error": str(e2)},
                     "neighbors":          sg.get("neighbors", []),
-                })
+                }
+                writer.put(error_record)
+                error_count += 1
 
         except Exception as e:
             logger.error("run_rag_analysis: session_id=%s 오류 — %s", session_id, e)
-            results.append({
+            error_record = {
                 "session_id":         session_id,
                 "uid":                sg["session"].get("uid"),
                 "inference_datetime": inference_dt,
                 "session":            sg["session"],
                 "analysis":           {"error": str(e)},
                 "neighbors":          sg.get("neighbors", []),
-            })
+            }
+            writer.put(error_record)
+            error_count += 1
 
         time.sleep(GROQ_RPM_SLEEP)
 
+    # ── 모든 추론 완료 → writer flush ─────────────────────────────────────────
+    saved_count, write_errors = writer.finish()
+
     logger.info(
-        "run_rag_analysis: %d 건 분석 완료 (inference_datetime: %s, fallback: %s)",
-        len(results), inference_dt, use_fallback,
+        "run_rag_analysis: %d 건 분석 완료 | S3 저장 %d 건 | write 오류 %d | "
+        "분석 오류 %d | inference_datetime: %s | fallback: %s",
+        len(subgraphs), saved_count, write_errors, error_count, inference_dt, use_fallback,
     )
-    ctx["ti"].xcom_push(key="rag_results",        value=results)
-    ctx["ti"].xcom_push(key="inference_datetime", value=inference_dt)
+ 
+    # XCom — 경량 메타데이터만
+    ctx["ti"].xcom_push(key="saved_s3_key",       value=s3_key)
+    ctx["ti"].xcom_push(key="saved_count",         value=saved_count)
+    ctx["ti"].xcom_push(key="inference_datetime",  value=inference_dt)
+    ctx["ti"].xcom_push(key="error_count",         value=error_count)
+    ctx["ti"].xcom_push(key="threat_dist",         value=threat_dist)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Task 5 : save_rag_results
 # ══════════════════════════════════════════════════════════════════════════════
 
-def save_rag_results(**ctx) -> None:
-    results: list[dict] = ctx["ti"].xcom_pull(
-        task_ids="run_rag_analysis", key="rag_results"
-    ) or []
-
-    if not results:
-        logger.warning("save_rag_results: 저장할 결과 없음")
-        return
-
-    partition = ctx["ti"].xcom_pull(
-        task_ids="load_session_gold", key="gold_partition"
-    ) or {}
-    s3_key = _build_rag_s3_key(partition)
-
-    body = "\n".join(json.dumps(r, ensure_ascii=False) for r in results)
-    _s3_client().put_object(
-        Bucket=S3_BUCKET, Key=s3_key,
-        Body=body.encode("utf-8"), ContentType="application/jsonl",
-    )
-    logger.info("save_rag_results: s3://%s/%s 에 %d 건 저장", S3_BUCKET, s3_key, len(results))
-    ctx["ti"].xcom_push(key="saved_count", value=len(results))
-    ctx["ti"].xcom_push(key="saved_s3_key", value=s3_key)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Task 6 : report_rag_stats
-# ══════════════════════════════════════════════════════════════════════════════
-
 def report_rag_stats(**ctx) -> None:
-    ti           = ctx["ti"]
+    ti = ctx["ti"]
+ 
     total_loaded = ti.xcom_pull(task_ids="load_session_gold", key="total_loaded")    or 0
     filter_stats = ti.xcom_pull(task_ids="filter_whitelist",  key="filter_stats")    or {}
-    results      = ti.xcom_pull(task_ids="run_rag_analysis",  key="rag_results")     or []
-    saved_count  = ti.xcom_pull(task_ids="save_rag_results",  key="saved_count")     or 0
-    saved_key    = ti.xcom_pull(task_ids="save_rag_results",  key="saved_s3_key")    or "-"
+ 
+    # v8: run_rag_analysis에서 직접 집계한 값 사용 (rag_results 전체 XCom 없음)
+    saved_count  = ti.xcom_pull(task_ids="run_rag_analysis",  key="saved_count")     or 0
+    saved_key    = ti.xcom_pull(task_ids="run_rag_analysis",  key="saved_s3_key")    or "-"
     inference_dt = ti.xcom_pull(task_ids="run_rag_analysis",  key="inference_datetime") or "-"
-
-    threat_dist: dict[str, int] = {}
-    error_count = 0
-    for r in results:
-        a = r.get("analysis", {})
-        if a.get("error") or a.get("parse_error"):
-            error_count += 1
-            continue
-        tt = a.get("threat_type", "Unknown")
-        threat_dist[tt] = threat_dist.get(tt, 0) + 1
-
+    error_count  = ti.xcom_pull(task_ids="run_rag_analysis",  key="error_count")     or 0
+    threat_dist  = ti.xcom_pull(task_ids="run_rag_analysis",  key="threat_dist")     or {}
+ 
     logger.info("=" * 70)
-    logger.info("▶ neo4j_to_rag 추론 파이프라인 완료 요약 (v7)")
+    logger.info("▶ neo4j_to_rag 추론 파이프라인 완료 요약 (v8)")
     logger.info("=" * 70)
     logger.info("  [입력]  session_gold 로드      : %d 세션", total_loaded)
     logger.info("  [필터]  화이트리스트 제외       : %d", filter_stats.get("whitelist_ip", 0))
     logger.info("  [필터]  저점수 제외             : %d", filter_stats.get("low_score", 0))
-    logger.info("  [분석]  RAG 분석 세션           : %d", len(results))
     logger.info("  [추론]  inference_datetime      : %s (KST)", inference_dt)
     logger.info("  [저장]  S3 저장 건수            : %d", saved_count)
     logger.info("  [저장]  S3 경로                 : s3://%s/%s", S3_BUCKET, saved_key)
@@ -1021,6 +1209,7 @@ def report_rag_stats(**ctx) -> None:
     for tt, cnt in sorted(threat_dist.items(), key=lambda x: -x[1]):
         logger.info("    %-45s %d", tt, cnt)
     logger.info("=" * 70)
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1037,13 +1226,13 @@ default_args = {
 
 with DAG(
     dag_id="neo4j_to_rag",
-    description="추론 DAG — session_gold parquet → whitelist → Neo4j enrichment → Groq RAG (v7)",
+    description="추론 DAG — session_gold parquet → whitelist → Neo4j enrichment → Groq RAG (streaming S3 write)",
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
     schedule=None,         # TriggerDagRunOperator 전용
     catchup=False,
     max_active_runs=4,     # unified_events_to_gold 동시 실행 수와 맞춤
-    tags=["cti", "graph-rag", "groq"],
+    tags=["graph-rag"],
 ) as dag:
 
     t_resolve  = PythonOperator(task_id="resolve_session_gold_prefix", python_callable=resolve_session_gold_prefix)
@@ -1051,7 +1240,6 @@ with DAG(
     t_filter   = PythonOperator(task_id="filter_whitelist",            python_callable=filter_whitelist)
     t_subgraph = PythonOperator(task_id="build_subgraphs",             python_callable=build_subgraphs)
     t_rag      = PythonOperator(task_id="run_rag_analysis",            python_callable=run_rag_analysis)
-    t_save     = PythonOperator(task_id="save_rag_results",            python_callable=save_rag_results)
     t_report   = PythonOperator(task_id="report_rag_stats",            python_callable=report_rag_stats)
 
-    t_resolve >> t_load >> t_filter >> t_subgraph >> t_rag >> t_save >> t_report
+    t_resolve >> t_load >> t_filter >> t_subgraph >> t_rag >> t_report
