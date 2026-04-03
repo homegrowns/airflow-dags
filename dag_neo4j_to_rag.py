@@ -2,33 +2,23 @@
 dag_neo4j_to_rag.py
 실시간 추론 DAG — session_gold parquet (S3) → whitelist → Neo4j enrichment → Groq RAG
 
+[v9 변경점]
+  - run_rag_analysis 병렬 추론 추가
+    · 서브그래프 600개 초과 시 300개씩 청크로 분할
+    · ThreadPoolExecutor로 청크 병렬 처리 (최대 워커 수 = PARALLEL_MAX_WORKERS)
+    · 각 워커가 독립적인 Groq 클라이언트 + fallback 상태 보유
+    · writer.put() / error_counter / threat_dist 는 lock으로 thread-safe 보장
+    · 600개 이하: 기존 순차 처리 유지
+
 [v8 변경점]
   - XCom 대용량 데이터 전달 제거 → S3 임시 저장 방식으로 교체
-    · raw_sessions, filtered_sessions, subgraphs → S3 tmp/ 경로에 JSON 저장
-    · XCom에는 S3 키만 전달 (경량 메타데이터)
   - OOM / Airflow DB 과부하 방지
 
 [v7 변경점]
-  - max_active_runs: 1 → 4 (unified_events_to_gold 동시 실행 대응)
-  - schedule=None: TriggerDagRunOperator 전용 (자체 스케줄 없음)
+  - max_active_runs: 1 → 4
+  - schedule=None: TriggerDagRunOperator 전용
   - resolve_session_gold_prefix: conf에서 session_key 직접 수신
-    · conf["session_key"]: 정확한 parquet 경로
-    · conf["source_run_id"]: 트리거한 unified run_id (로깅용)
   - 모든 ts → KST 변환
-  - inference_datetime: DAG 실행 시각 KST
-
-Pipeline:
-  [resolve_session_gold_prefix] ← conf에서 session_key / source_run_id 수신
-          ↓
-  [load_session_gold]           ← 해당 배치 parquet만 읽기 → S3 tmp 저장
-          ↓
-  [filter_whitelist]            ← S3 tmp 읽기 → whitelist + suspicion_score → S3 tmp 저장
-          ↓
-  [build_subgraphs]             ← S3 tmp 읽기 → Neo4j 1-hop enrichment → S3 tmp 저장
-          ↓
-  [run_rag_analysis]            ← S3 tmp 읽기 → Groq LLM 위협 분석 → S3 저장
-          ↓
-  [report_rag_stats]            ← 통계 로그
 
 Author : Linda
 """
@@ -46,7 +36,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import threading
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 
 import boto3
 from airflow import DAG
@@ -60,16 +50,20 @@ KST = ZoneInfo("Asia/Seoul")
 S3_BUCKET              = "malware-project-bucket"
 S3_SESSION_GOLD_PREFIX = "gold/session_gold/"
 S3_RAG_PREFIX          = "rag_result"
-S3_TMP_PREFIX          = "tmp/neo4j_to_rag"   # ← 임시 데이터 저장 경로
+S3_TMP_PREFIX          = "tmp/neo4j_to_rag"
 AWS_REGION             = "ap-northeast-2"
 
 NEO4J_BATCH_SIZE    = 50
 GROQ_RPM_SLEEP      = 2.0
-MAX_SESSIONS        = 200
 GROQ_MODEL_DEFAULT  = "llama-3.3-70b-versatile"
 GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"
 
 S3_WRITE_WORKERS = 2
+
+# ── 병렬 추론 설정 ─────────────────────────────────────────────────────────────
+PARALLEL_THRESHOLD   = 600   # 이 수 초과 시 병렬 처리
+PARALLEL_CHUNK_SIZE  = 300   # 청크당 세션 수
+PARALLEL_MAX_WORKERS = 4     # 최대 병렬 워커 수 (Groq RPM 고려)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -131,8 +125,9 @@ def _ms_to_kst_iso(ms: Any) -> str | None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# S3 tmp 읽기/쓰기 헬퍼 (XCom 대체)
+# S3 tmp 읽기/쓰기 헬퍼
 # ══════════════════════════════════════════════════════════════════════════════
+
 def _s3_tmp_key(run_id: str, stage: str) -> str:
     safe_run_id = re.sub(r'[^a-zA-Z0-9_\-.]', '-', run_id)
     return f"{S3_TMP_PREFIX}/{safe_run_id}/{stage}.json"
@@ -141,10 +136,7 @@ def _s3_tmp_key(run_id: str, stage: str) -> str:
 def _s3_write_json(s3_key: str, data: Any) -> None:
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
     _s3_client().put_object(
-        Bucket=S3_BUCKET,
-        Key=s3_key,
-        Body=body,
-        ContentType="application/json",
+        Bucket=S3_BUCKET, Key=s3_key, Body=body, ContentType="application/json",
     )
     logger.info("_s3_write_json: s3://%s/%s (%d bytes)", S3_BUCKET, s3_key, len(body))
 
@@ -157,7 +149,6 @@ def _s3_read_json(s3_key: str) -> Any:
 
 
 def _s3_delete(s3_key: str) -> None:
-    """tmp 파일 정리 (실패해도 무시)"""
     try:
         _s3_client().delete_object(Bucket=S3_BUCKET, Key=s3_key)
         logger.info("_s3_delete: %s 삭제 완료", s3_key)
@@ -214,7 +205,7 @@ def _build_rag_s3_key(partition: dict[str, str]) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# S3StreamingWriter
+# S3StreamingWriter (thread-safe)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _S3StreamingWriter:
@@ -282,10 +273,8 @@ class _S3StreamingWriter:
         )
         try:
             _s3_client().put_object(
-                Bucket=S3_BUCKET,
-                Key=ck_key,
-                Body=(line + "\n").encode("utf-8"),
-                ContentType="application/jsonl",
+                Bucket=S3_BUCKET, Key=ck_key,
+                Body=(line + "\n").encode("utf-8"), ContentType="application/jsonl",
             )
             with self._lock:
                 self._checkpoint_keys.append(ck_key)
@@ -297,7 +286,7 @@ class _S3StreamingWriter:
             keys = list(self._checkpoint_keys)
         if not keys:
             return
-        s3 = _s3_client()
+        s3    = _s3_client()
         BATCH = 1000
         deleted_total = 0
         for i in range(0, len(keys), BATCH):
@@ -379,49 +368,49 @@ CATEGORY_TO_CLASSTYPE: dict[str, str] = {
 }
 
 CLASSTYPE_SCORE_RANGE: dict[str, tuple[int, int]] = {
-    "web-application-attack":       (70, 95),
-    "trojan-activity":              (75, 95),
-    "command-and-control":          (80, 100),
-    "domain-c2":                    (80, 100),
-    "exploit-kit":                  (75, 95),
-    "shellcode-detect":             (75, 95),
-    "targeted-activity":            (70, 95),
-    "attempted-admin":              (65, 90),
-    "successful-admin":             (85, 100),
-    "attempted-user":               (60, 85),
-    "unsuccessful-user":            (55, 80),
-    "successful-user":              (70, 90),
-    "credential-theft":             (80, 100),
-    "policy-violation":             (60, 85),
-    "inappropriate-content":        (50, 75),
-    "misc-attack":                  (45, 70),
-    "bad-unknown":                  (40, 65),
-    "attempted-dos":                (55, 80),
-    "successful-dos":               (65, 85),
-    "denial-of-service":            (60, 85),
-    "attempted-recon":              (40, 65),
-    "successful-recon-limited":     (45, 65),
-    "successful-recon-largescale":  (55, 75),
-    "string-detect":                (35, 60),
-    "suspicious-filename-detect":   (45, 70),
-    "suspicious-login":             (45, 70),
-    "default-login-attempt":        (45, 70),
+    "web-application-attack":         (70, 95),
+    "trojan-activity":                (75, 95),
+    "command-and-control":            (80, 100),
+    "domain-c2":                      (80, 100),
+    "exploit-kit":                    (75, 95),
+    "shellcode-detect":               (75, 95),
+    "targeted-activity":              (70, 95),
+    "attempted-admin":                (65, 90),
+    "successful-admin":               (85, 100),
+    "attempted-user":                 (60, 85),
+    "unsuccessful-user":              (55, 80),
+    "successful-user":                (70, 90),
+    "credential-theft":               (80, 100),
+    "policy-violation":               (60, 85),
+    "inappropriate-content":          (50, 75),
+    "misc-attack":                    (45, 70),
+    "bad-unknown":                    (40, 65),
+    "attempted-dos":                  (55, 80),
+    "successful-dos":                 (65, 85),
+    "denial-of-service":              (60, 85),
+    "attempted-recon":                (40, 65),
+    "successful-recon-limited":       (45, 65),
+    "successful-recon-largescale":    (55, 75),
+    "string-detect":                  (35, 60),
+    "suspicious-filename-detect":     (45, 70),
+    "suspicious-login":               (45, 70),
+    "default-login-attempt":          (45, 70),
     "unusual-client-port-connection": (35, 60),
-    "non-standard-protocol":        (35, 60),
-    "external-ip-check":            (30, 55),
-    "web-application-activity":     (30, 55),
-    "social-engineering":           (50, 75),
-    "coin-mining":                  (50, 70),
-    "pup-activity":                 (25, 50),
-    "rpc-portmap-decode":           (25, 50),
-    "system-call-detect":           (40, 65),
-    "not-suspicious":               (5,  25),
-    "unknown":                      (20, 45),
-    "misc-activity":                (10, 35),
-    "icmp-event":                   (10, 30),
-    "protocol-command-decode":      (10, 30),
-    "network-scan":                 (35, 60),
-    "tcp-connection":               (5,  20),
+    "non-standard-protocol":          (35, 60),
+    "external-ip-check":              (30, 55),
+    "web-application-activity":       (30, 55),
+    "social-engineering":             (50, 75),
+    "coin-mining":                    (50, 70),
+    "pup-activity":                   (25, 50),
+    "rpc-portmap-decode":             (25, 50),
+    "system-call-detect":             (40, 65),
+    "not-suspicious":                 (5,  25),
+    "unknown":                        (20, 45),
+    "misc-activity":                  (10, 35),
+    "icmp-event":                     (10, 30),
+    "protocol-command-decode":        (10, 30),
+    "network-scan":                   (35, 60),
+    "tcp-connection":                 (5,  20),
 }
 
 _CLASSTYPE_RANK: dict[str, int] = {
@@ -597,7 +586,6 @@ def resolve_session_gold_prefix(**ctx) -> None:
     partition = _parse_gold_partition(prefix)
     logger.info("resolve_session_gold_prefix: partition = %s", partition)
 
-    # XCom: 경량 메타데이터만
     ctx["ti"].xcom_push(key="session_gold_prefix", value=prefix)
     ctx["ti"].xcom_push(key="gold_partition",       value=partition)
 
@@ -699,11 +687,10 @@ def load_session_gold(**ctx) -> None:
     raw_sessions = list(merged.values())
     logger.info("load_session_gold 완료 — %d 세션", len(raw_sessions))
 
-    # ── XCom 대신 S3 tmp에 저장 ──────────────────────────────────────────────
     tmp_key = _s3_tmp_key(run_id, "raw_sessions")
     _s3_write_json(tmp_key, raw_sessions)
 
-    ctx["ti"].xcom_push(key="raw_sessions_s3_key", value=tmp_key)   # S3 키만 XCom
+    ctx["ti"].xcom_push(key="raw_sessions_s3_key", value=tmp_key)
     ctx["ti"].xcom_push(key="total_loaded",         value=len(raw_sessions))
 
 
@@ -714,7 +701,6 @@ def load_session_gold(**ctx) -> None:
 def filter_whitelist(**ctx) -> None:
     run_id: str = ctx["run_id"]
 
-    # ── S3 tmp에서 읽기 ──────────────────────────────────────────────────────
     raw_sessions_key = ctx["ti"].xcom_pull(
         task_ids="load_session_gold", key="raw_sessions_s3_key"
     )
@@ -743,11 +729,8 @@ def filter_whitelist(**ctx) -> None:
         filtered["whitelist_ip"], filtered["low_score"],
     )
 
-    # ── S3 tmp에 저장 ─────────────────────────────────────────────────────────
     tmp_key = _s3_tmp_key(run_id, "filtered_sessions")
     _s3_write_json(tmp_key, passed)
-
-    # raw_sessions tmp 정리
     _s3_delete(raw_sessions_key)
 
     ctx["ti"].xcom_push(key="filtered_sessions_s3_key", value=tmp_key)
@@ -761,7 +744,6 @@ def filter_whitelist(**ctx) -> None:
 def build_subgraphs(**ctx) -> None:
     run_id: str = ctx["run_id"]
 
-    # ── S3 tmp에서 읽기 ──────────────────────────────────────────────────────
     filtered_key = ctx["ti"].xcom_pull(
         task_ids="filter_whitelist", key="filtered_sessions_s3_key"
     )
@@ -830,64 +812,43 @@ def build_subgraphs(**ctx) -> None:
         len(subgraphs), neo4j_hit, total_edges, len(subgraphs) - neo4j_hit,
     )
 
-    # ── S3 tmp에 저장 ─────────────────────────────────────────────────────────
     tmp_key = _s3_tmp_key(run_id, "subgraphs")
     _s3_write_json(tmp_key, subgraphs)
-
-    # filtered_sessions tmp 정리
     _s3_delete(filtered_key)
 
     ctx["ti"].xcom_push(key="subgraphs_s3_key", value=tmp_key)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Task 4 : run_rag_analysis
+# RAG 추론 공통 헬퍼
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _subgraph_to_text(subgraph: dict) -> str:
-    s = subgraph["session"]
-    alerts = [
-        ev for ev in s.get("timeline", [])
-        if ev.get("source") == "suricata" and ev.get("signature")
-    ]
-    lines = [
-        "[현재 세션 정보]",
-        f"  session_id   : {s.get('session_id')}",
-        f"  src_ip       : {s.get('src_ip')}  →  dest_ip : {s.get('dest_ip')}",
-        f"  proto        : {s.get('proto')}       port    : {s.get('dest_port')}",
-        f"  alert_count  : {s.get('alert_count')}   max_severity : {s.get('max_severity')}",
-        f"  conn_state   : {s.get('conn_state') or 'N/A'}",
-        f"  tls_sni      : {s.get('tls_sni') or 'N/A'}",
-        f"  http_host    : {s.get('http_host') or 'N/A'}",
-        f"  http_uri     : {s.get('http_uri') or 'N/A'}",
-        f"  http_version : {s.get('http_version') or 'N/A'}",
-        f"  dns_query    : {s.get('dns_query') or 'N/A'}",
-        f"  flow_start   : {s.get('flow_start')}",
-        "",
-    ]
-    if alerts:
-        lines.append("[Suricata Alerts]")
-        for av in alerts:
-            lines.append(
-                f"  severity={av.get('severity')}  "
-                f"category={av.get('category') or 'N/A'}  "
-                f"signature={av.get('signature')}"
-            )
-        lines.append("")
+def _fix_json_escapes(raw: str) -> str:
+    return re.sub(r'\\x([0-9a-fA-F]{2})', lambda m: f'\\u00{m.group(1)}', raw)
 
-    neighbors = subgraph.get("neighbors", [])
-    if neighbors:
-        lines.append("[Neo4j 과거 행위 (1-hop)]")
-        for nb in neighbors:
-            label = (nb.get("node_labels") or ["?"])[0]
-            value = nb.get("node_value", "")
-            rel   = nb.get("rel_type", "")
-            extra = (f"  signature={nb['signature']}  category={nb.get('category')}"
-                     if nb.get("signature") else "")
-            lines.append(f"  -[{rel}]→ :{label} '{value}'{extra}")
-    else:
-        lines.append("[Neo4j 과거 행위] 없음 (신규 세션 또는 미수집)")
-    return "\n".join(lines)
+
+def _parse_response(raw: str, suspicion_score: int = 0) -> dict:
+    for text in (raw, raw.replace("```json", "").replace("```", "").strip()):
+        try:
+            result = json.loads(text)
+            if "threat_score" not in result:
+                result["threat_score"] = max(0, min(100, int(suspicion_score)))
+            return result
+        except json.JSONDecodeError:
+            pass
+    fixed = _fix_json_escapes(raw)
+    try:
+        result = json.loads(fixed)
+        if "threat_score" not in result:
+            result["threat_score"] = max(0, min(100, int(suspicion_score)))
+        return result
+    except json.JSONDecodeError:
+        pass
+    return {
+        "parse_error": True,
+        "raw_response": raw,
+        "threat_score": max(0, min(100, int(suspicion_score))),
+    }
 
 
 _SYSTEM_PROMPT = """\
@@ -950,28 +911,184 @@ threat_score는 0~100 사이 정수이며, 아래 기준에 따라 산정할 것
 2. 기준 범위 안에서 아래 가중치를 적용해 최종 점수를 결정할 것:
    +10 : max_severity == 1
    + 5 : alert_count >= 3
-   + 5 : conn_state가 RSTO, RSTR, S0 중 하나 (비정상 종료/연결 미완)
-   + 5 : src_ip가 공인 IP이고 dest_ip가 내부망 대역 (10.x, 172.16~31.x, 192.168.x)
-   + 8 : Neo4j에서 동일 src_ip의 related_session_count >= 50 (반복 다발 공격)
-   + 5 : Neo4j에서 동일 src_ip의 related_session_count >= 10
+   + 5 : conn_state가 RSTO, RSTR, S0 중 하나
+   + 5 : src_ip가 공인 IP이고 dest_ip가 내부망 대역
+   + 8 : Neo4j related_session_count >= 50
+   + 5 : Neo4j related_session_count >= 10
 
-3. 가중치 합산 후에도 반드시 해당 threat_type의 범위 내로 클램프할 것.
-   예) Web Application Attack 기준 82점 + 가중치 15 = 97 → 상한 95로 클램프
+3. 가중치 합산 후에도 해당 threat_type 범위 내로 클램프할 것.
 
 Analyze and respond ONLY in this JSON format (no markdown, no explanation):
 {
   "threat_type": "<Web Application Attack | A Network Trojan was detected | Malware Command and Control Activity Detected | Domain Observed Used for C2 Detected | Exploit Kit Activity Detected | Executable code was detected | Targeted Malicious Activity was Detected | Attempted Administrator Privilege Gain | Successful Administrator Privilege Gain | Attempted User Privilege Gain | Unsuccessful User Privilege Gain | Successful User Privilege Gain | Successful Credential Theft Detected | Potential Corporate Privacy Violation | Inappropriate Content was Detected | Misc Attack | Potentially Bad Traffic | Attempted Denial of Service | Denial of Service | Detection of a Denial of Service Attack | Attempted Information Leak | Information Leak | Large Scale Information Leak | A suspicious string was detected | A suspicious filename was detected | An attempted login using a suspicious username was detected | Attempt to login by a default username and password | A client was using an unusual port | Detection of a non-standard protocol or event | Device Retrieving External IP Address Detected | access to a potentially vulnerable web application | Possible Social Engineering Attempted | Crypto Currency Mining Activity Detected | Possibly Unwanted Program Detected | Decode of an RPC Query | A system call was detected | Not Suspicious Traffic | Unknown Traffic | Misc activity | Generic ICMP event | Generic Protocol Command Decode | Detection of a Network Scan | A TCP connection was detected>",
-  "threat_score": <0~100 정수. 위 THREAT SCORE RULES에 따라 산정>,
-  "summary": "<2~3문장 한국어 위협 요약. 반드시 개조식(~임. ~됨. ~필요.) 한국어로만 작성. 위 필드 중 실제로 존재하는 값을 구체적으로 인용하여 판단 근거를 서술할 것. N/A이거나 없는 필드는 언급하지 말 것>",
+  "threat_score": <0~100 정수>,
+  "summary": "<2~3문장 한국어 위협 요약. 개조식(~임. ~됨. ~필요.). N/A 필드 언급 금지>",
   "recommended_action": "<한 줄 대응 권고>"
 }
 """
 
 
-def run_rag_analysis(**ctx) -> None:
+def _subgraph_to_text(subgraph: dict) -> str:
+    s = subgraph["session"]
+    alerts = [
+        ev for ev in s.get("timeline", [])
+        if ev.get("source") == "suricata" and ev.get("signature")
+    ]
+    lines = [
+        "[현재 세션 정보]",
+        f"  session_id   : {s.get('session_id')}",
+        f"  src_ip       : {s.get('src_ip')}  →  dest_ip : {s.get('dest_ip')}",
+        f"  proto        : {s.get('proto')}       port    : {s.get('dest_port')}",
+        f"  alert_count  : {s.get('alert_count')}   max_severity : {s.get('max_severity')}",
+        f"  conn_state   : {s.get('conn_state') or 'N/A'}",
+        f"  tls_sni      : {s.get('tls_sni') or 'N/A'}",
+        f"  http_host    : {s.get('http_host') or 'N/A'}",
+        f"  http_uri     : {s.get('http_uri') or 'N/A'}",
+        f"  http_version : {s.get('http_version') or 'N/A'}",
+        f"  dns_query    : {s.get('dns_query') or 'N/A'}",
+        f"  flow_start   : {s.get('flow_start')}",
+        "",
+    ]
+    if alerts:
+        lines.append("[Suricata Alerts]")
+        for av in alerts:
+            lines.append(
+                f"  severity={av.get('severity')}  "
+                f"category={av.get('category') or 'N/A'}  "
+                f"signature={av.get('signature')}"
+            )
+        lines.append("")
+
+    neighbors = subgraph.get("neighbors", [])
+    if neighbors:
+        lines.append("[Neo4j 과거 행위 (1-hop)]")
+        for nb in neighbors:
+            label = (nb.get("node_labels") or ["?"])[0]
+            value = nb.get("node_value", "")
+            rel   = nb.get("rel_type", "")
+            extra = (f"  signature={nb['signature']}  category={nb.get('category')}"
+                     if nb.get("signature") else "")
+            lines.append(f"  -[{rel}]→ :{label} '{value}'{extra}")
+    else:
+        lines.append("[Neo4j 과거 행위] 없음 (신규 세션 또는 미수집)")
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 청크 처리 워커 (병렬 모드에서 각 스레드가 실행)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _process_chunk(
+    chunk:         list[dict],
+    chunk_idx:     int,
+    inference_dt:  str,
+    writer:        _S3StreamingWriter,
+    error_lock:    threading.Lock,
+    error_counter: list[int],           # [0] 인덱스로 공유 카운터
+    threat_dist:   dict[str, int],
+    threat_lock:   threading.Lock,
+) -> int:
+    """
+    단일 청크를 순차 처리하는 워커.
+    - 워커별 독립 Groq 클라이언트 & fallback 상태
+    - writer.put() / error_counter / threat_dist 접근은 lock으로 보호
+    """
     from groq import RateLimitError
 
-    # ── S3 tmp에서 읽기 ──────────────────────────────────────────────────────
+    groq         = _groq_client()
+    model        = _groq_model()
+    use_fallback = False
+    processed    = 0
+
+    logger.info("_process_chunk[%d]: %d개 처리 시작", chunk_idx, len(chunk))
+
+    for i, sg in enumerate(chunk):
+        session_id    = sg["session"].get("session_id", f"c{chunk_idx}_u{i}")
+        user_text     = _subgraph_to_text(sg)
+        current_model = GROQ_FALLBACK_MODEL if use_fallback else model
+
+        def _call(mdl: str):
+            return groq.chat.completions.create(
+                model=mdl,
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user",   "content": user_text},
+                ],
+                temperature=0.1,
+                max_tokens=1024,
+            )
+
+        def _write(response) -> None:
+            raw             = response.choices[0].message.content.strip()
+            suspicion_score = sg["session"].get("suspicion_score", 0)
+            analysis        = _parse_response(raw, suspicion_score)
+            writer.put({
+                "session_id":         session_id,
+                "uid":                sg["session"].get("uid"),
+                "inference_datetime": inference_dt,
+                "session":            sg["session"],
+                "analysis":           analysis,
+                "neighbors":          sg.get("neighbors", []),
+            })
+            if analysis.get("parse_error") or analysis.get("error"):
+                with error_lock:
+                    error_counter[0] += 1
+            else:
+                tt = analysis.get("threat_type", "Unknown")
+                with threat_lock:
+                    threat_dist[tt] = threat_dist.get(tt, 0) + 1
+
+        try:
+            _write(_call(current_model))
+
+        except RateLimitError:
+            if not use_fallback:
+                logger.warning(
+                    "_process_chunk[%d] session=%s RateLimit — 60초 대기 후 fallback",
+                    chunk_idx, session_id,
+                )
+                use_fallback = True
+                time.sleep(60)
+            else:
+                logger.warning(
+                    "_process_chunk[%d] session=%s fallback RateLimit — 2초 대기",
+                    chunk_idx, session_id,
+                )
+                time.sleep(2)
+            try:
+                _write(_call(GROQ_FALLBACK_MODEL))
+            except Exception as e2:
+                logger.error("_process_chunk[%d] session=%s fallback 실패 — %s", chunk_idx, session_id, e2)
+                writer.put({
+                    "session_id": session_id, "uid": sg["session"].get("uid"),
+                    "inference_datetime": inference_dt, "session": sg["session"],
+                    "analysis": {"error": str(e2)}, "neighbors": sg.get("neighbors", []),
+                })
+                with error_lock:
+                    error_counter[0] += 1
+
+        except Exception as e:
+            logger.error("_process_chunk[%d] session=%s 오류 — %s", chunk_idx, session_id, e)
+            writer.put({
+                "session_id": session_id, "uid": sg["session"].get("uid"),
+                "inference_datetime": inference_dt, "session": sg["session"],
+                "analysis": {"error": str(e)}, "neighbors": sg.get("neighbors", []),
+            })
+            with error_lock:
+                error_counter[0] += 1
+
+        time.sleep(GROQ_RPM_SLEEP)
+        processed += 1
+
+    logger.info("_process_chunk[%d]: %d개 완료", chunk_idx, processed)
+    return processed
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Task 4 : run_rag_analysis
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_rag_analysis(**ctx) -> None:
     subgraphs_key = ctx["ti"].xcom_pull(
         task_ids="build_subgraphs", key="subgraphs_s3_key"
     )
@@ -995,137 +1112,67 @@ def run_rag_analysis(**ctx) -> None:
     writer       = _S3StreamingWriter(s3_key)
     writer.start()
 
-    groq         = _groq_client()
-    model        = _groq_model()
-    use_fallback = False
-    inference_dt = _now_kst_iso()
-    error_count  = 0
-    threat_dist: dict[str, int] = {}
+    inference_dt  = _now_kst_iso()
+    error_counter = [0]                   # thread 간 공유 카운터
+    error_lock    = threading.Lock()
+    threat_dist:  dict[str, int] = {}
+    threat_lock   = threading.Lock()
 
-    def _fix_json_escapes(raw: str) -> str:
-        return re.sub(r'\\x([0-9a-fA-F]{2})', lambda m: f'\\u00{m.group(1)}', raw)
+    total = len(subgraphs)
 
-    def _parse_response(raw: str, suspicion_score: int = 0) -> dict:
-        for text in (raw, raw.replace("```json", "").replace("```", "").strip()):
-            try:
-                result = json.loads(text)
-                if "threat_score" not in result:
-                    result["threat_score"] = max(0, min(100, int(suspicion_score)))
-                return result
-            except json.JSONDecodeError:
-                pass
-        fixed = _fix_json_escapes(raw)
-        try:
-            result = json.loads(fixed)
-            if "threat_score" not in result:
-                result["threat_score"] = max(0, min(100, int(suspicion_score)))
-            return result
-        except json.JSONDecodeError:
-            pass
-        return {
-            "parse_error": True,
-            "raw_response": raw,
-            "threat_score": max(0, min(100, int(suspicion_score))),
-        }
+    if total > PARALLEL_THRESHOLD:
+        # ── 병렬 모드: 300개씩 청크 분할 ──────────────────────────────────
+        chunks   = [subgraphs[i : i + PARALLEL_CHUNK_SIZE]
+                    for i in range(0, total, PARALLEL_CHUNK_SIZE)]
+        n_workers = min(len(chunks), PARALLEL_MAX_WORKERS)
 
-    def _build_and_write(response, session_id: str, sg: dict) -> None:
-        nonlocal error_count
-        raw             = response.choices[0].message.content.strip()
-        suspicion_score = sg["session"].get("suspicion_score", 0)
-        analysis        = _parse_response(raw, suspicion_score)
+        logger.info(
+            "run_rag_analysis: 병렬 모드 — %d개 → %d 청크 × 워커 %d개",
+            total, len(chunks), n_workers,
+        )
 
-        record = {
-            "session_id":         session_id,
-            "uid":                sg["session"].get("uid"),
-            "inference_datetime": inference_dt,
-            "session":            sg["session"],
-            "analysis":           analysis,
-            "neighbors":          sg.get("neighbors", []),
-        }
-        writer.put(record)
+        with ThreadPoolExecutor(
+            max_workers=n_workers, thread_name_prefix="rag_chunk"
+        ) as pool:
+            futures = {
+                pool.submit(
+                    _process_chunk,
+                    chunk, idx, inference_dt,
+                    writer, error_lock, error_counter,
+                    threat_dist, threat_lock,
+                ): idx
+                for idx, chunk in enumerate(chunks)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    processed = future.result()
+                    logger.info("run_rag_analysis: 청크[%d] 완료 — %d건", idx, processed)
+                except Exception as e:
+                    logger.error("run_rag_analysis: 청크[%d] 실패 — %s", idx, e)
 
-        if analysis.get("parse_error") or analysis.get("error"):
-            error_count += 1
-        else:
-            tt = analysis.get("threat_type", "Unknown")
-            threat_dist[tt] = threat_dist.get(tt, 0) + 1
-
-    for i, sg in enumerate(subgraphs):
-        session_id    = sg["session"].get("session_id", f"unknown_{i}")
-        user_text     = _subgraph_to_text(sg)
-        current_model = GROQ_FALLBACK_MODEL if use_fallback else model
-
-        try:
-            response = groq.chat.completions.create(
-                model=current_model,
-                messages=[
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user",   "content": user_text},
-                ],
-                temperature=0.1,
-                max_tokens=1024,
-            )
-            _build_and_write(response, session_id, sg)
-
-        except RateLimitError:
-            if not use_fallback:
-                logger.warning(
-                    "run_rag_analysis: session_id=%s Rate Limit — 60초 대기 후 fallback 전환",
-                    session_id,
-                )
-                use_fallback = True
-                time.sleep(60)
-            else:
-                logger.warning(
-                    "run_rag_analysis: session_id=%s fallback도 Rate Limit — 2초 대기", session_id,
-                )
-                time.sleep(2)
-            try:
-                response = groq.chat.completions.create(
-                    model="llama-3.1-8b-instant",
-                    messages=[
-                        {"role": "system", "content": _SYSTEM_PROMPT},
-                        {"role": "user",   "content": user_text},
-                    ],
-                    temperature=0.1,
-                    max_tokens=1024,
-                )
-                _build_and_write(response, session_id, sg)
-            except Exception as e2:
-                logger.error("run_rag_analysis: session_id=%s fallback 실패 — %s", session_id, e2)
-                writer.put({
-                    "session_id": session_id, "uid": sg["session"].get("uid"),
-                    "inference_datetime": inference_dt, "session": sg["session"],
-                    "analysis": {"error": str(e2)}, "neighbors": sg.get("neighbors", []),
-                })
-                error_count += 1
-
-        except Exception as e:
-            logger.error("run_rag_analysis: session_id=%s 오류 — %s", session_id, e)
-            writer.put({
-                "session_id": session_id, "uid": sg["session"].get("uid"),
-                "inference_datetime": inference_dt, "session": sg["session"],
-                "analysis": {"error": str(e)}, "neighbors": sg.get("neighbors", []),
-            })
-            error_count += 1
-
-        time.sleep(GROQ_RPM_SLEEP)
+    else:
+        # ── 순차 모드: 600개 이하 ──────────────────────────────────────────
+        logger.info("run_rag_analysis: 순차 모드 — %d개", total)
+        _process_chunk(
+            subgraphs, 0, inference_dt,
+            writer, error_lock, error_counter,
+            threat_dist, threat_lock,
+        )
 
     saved_count, write_errors = writer.finish()
-
-    # subgraphs tmp 정리
     _s3_delete(subgraphs_key)
 
     logger.info(
-        "run_rag_analysis: %d 건 분석 완료 | S3 저장 %d 건 | write 오류 %d | "
-        "분석 오류 %d | inference_datetime: %s | fallback: %s",
-        len(subgraphs), saved_count, write_errors, error_count, inference_dt, use_fallback,
+        "run_rag_analysis: %d건 분석 완료 | S3 저장 %d건 | write 오류 %d | "
+        "분석 오류 %d | inference_datetime: %s",
+        total, saved_count, write_errors, error_counter[0], inference_dt,
     )
 
     ctx["ti"].xcom_push(key="saved_s3_key",      value=s3_key)
     ctx["ti"].xcom_push(key="saved_count",        value=saved_count)
     ctx["ti"].xcom_push(key="inference_datetime", value=inference_dt)
-    ctx["ti"].xcom_push(key="error_count",        value=error_count)
+    ctx["ti"].xcom_push(key="error_count",        value=error_counter[0])
     ctx["ti"].xcom_push(key="threat_dist",        value=threat_dist)
 
 
@@ -1145,7 +1192,7 @@ def report_rag_stats(**ctx) -> None:
     threat_dist  = ti.xcom_pull(task_ids="run_rag_analysis",  key="threat_dist")        or {}
 
     logger.info("=" * 70)
-    logger.info("▶ neo4j_to_rag 추론 파이프라인 완료 요약 (v8)")
+    logger.info("▶ neo4j_to_rag 추론 파이프라인 완료 요약 (v9)")
     logger.info("=" * 70)
     logger.info("  [입력]  session_gold 로드      : %d 세션", total_loaded)
     logger.info("  [필터]  화이트리스트 제외       : %d", filter_stats.get("whitelist_ip", 0))
@@ -1174,7 +1221,7 @@ default_args = {
 
 with DAG(
     dag_id="neo4j_to_rag",
-    description="추론 DAG — session_gold parquet → whitelist → Neo4j enrichment → Groq RAG (S3 tmp 방식)",
+    description="추론 DAG — session_gold → whitelist → Neo4j → Groq RAG (S3 tmp + 병렬 추론 v9)",
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
     schedule=None,
