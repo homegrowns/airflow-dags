@@ -628,61 +628,82 @@ def load_session_gold(**ctx) -> None:
 
     df = pd.concat(frames, ignore_index=True)
     logger.info("load_session_gold: %d 행 로드", len(df))
-    df = df.drop(columns=[c for c in ("dt", "hour", "minute_10") if c in df.columns])
+    df = df.drop(columns=[c for c in ("dt", "hour", "batch_seq", "minute_10") if c in df.columns])
 
-    def _cvt(v: Any) -> Any:
-        if isinstance(v, float) and v != v: return None
-        if isinstance(v, bool):             return v
-        if isinstance(v, (int, str)):       return v
-        if hasattr(v, "item"):              return v.item()
-        if isinstance(v, list):             return v
-        return v
+    # ── flow_start / flow_end KST 변환 (벡터화) ──────────────────────────────
+    for col in ("flow_start", "flow_end"):
+        if col in df.columns:
+            df[col] = (
+                pd.to_datetime(df[col], utc=True, errors="coerce")
+                .dt.tz_convert("Asia/Seoul")
+                .dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+            )
 
-    NUMERIC_FIELDS = (
+    # ── NaN → None 일괄 변환 ─────────────────────────────────────────────────
+    df = df.where(df.notna(), other=None)
+
+    # ── timeline 파싱 (문자열인 경우만 변환) ──────────────────────────────────
+    def _parse_timeline(v):
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v)
+                return parsed if isinstance(parsed, list) else []
+            except json.JSONDecodeError:
+                return []
+        return v if isinstance(v, list) else []
+
+    if "timeline" in df.columns:
+        df["timeline"] = df["timeline"].apply(_parse_timeline)
+    else:
+        df["timeline"] = [[] for _ in range(len(df))]
+
+    # ── community_id 기준 병합 ────────────────────────────────────────────────
+    NUMERIC_FIELDS = {
         "uid", "flow_id", "src_ip", "src_port", "dest_ip", "dest_port",
         "proto", "service", "is_threat", "alert_count", "threat_level",
-    )
+    }
 
-    merged:     dict[str, dict] = {}
-    orphan_idx: int = 0
+    # community_id 없는 행 → orphan으로 분리
+    has_cid = df["community_id"].notna() & (df["community_id"] != "")
+    orphans = df[~has_cid].copy()
+    df_cid  = df[has_cid].copy()
 
-    for _, row in df.iterrows():
-        rec: dict[str, Any] = {k: _cvt(v) for k, v in row.to_dict().items()}
-        rec["flow_start"] = _ms_to_kst_iso(rec.get("flow_start"))
-        rec["flow_end"]   = _ms_to_kst_iso(rec.get("flow_end"))
+    merged: dict[str, dict] = {}
 
-        tl_raw = rec.get("timeline", [])
-        if isinstance(tl_raw, str):
-            try:
-                tl_parsed = json.loads(tl_raw)
-                if not isinstance(tl_parsed, list): tl_parsed = []
-            except json.JSONDecodeError:
-                tl_parsed = []
-        elif isinstance(tl_raw, list):
-            tl_parsed = tl_raw
-        else:
-            tl_parsed = []
-        rec["timeline"] = tl_parsed
+    # orphan 처리
+    for idx, row in enumerate(orphans.to_dict(orient="records")):
+        merged[f"_orphan_{idx}"] = row
 
-        cid = rec.get("community_id")
-        if not cid:
-            merged[f"_orphan_{orphan_idx}"] = rec
-            orphan_idx += 1
-            continue
+    # community_id 있는 행: groupby로 병합
+    if not df_cid.empty:
+        for cid, group in df_cid.groupby("community_id", sort=False):
+            records = group.to_dict(orient="records")
+            if len(records) == 1:
+                merged[cid] = records[0]
+                continue
 
-        if cid not in merged:
-            merged[cid] = rec
-        else:
-            ex = merged[cid]
-            ex["timeline"] = ex.get("timeline", []) + tl_parsed
-            for f in NUMERIC_FIELDS:
-                if rec.get(f) is not None: ex[f] = rec[f]
-            fs_old, fs_new = ex.get("flow_start"), rec.get("flow_start")
-            if fs_old and fs_new: ex["flow_start"] = min(fs_old, fs_new)
-            elif fs_new:          ex["flow_start"] = fs_new
-            fe_old, fe_new = ex.get("flow_end"), rec.get("flow_end")
-            if fe_old and fe_new: ex["flow_end"] = max(fe_old, fe_new)
-            elif fe_new:          ex["flow_end"] = fe_new
+            # 여러 행 병합
+            base = records[0].copy()
+            for rec in records[1:]:
+                # timeline 누적
+                base["timeline"] = base.get("timeline", []) + rec.get("timeline", [])
+                # numeric 필드: None이 아닌 값으로 덮어쓰기
+                for f in NUMERIC_FIELDS:
+                    if rec.get(f) is not None:
+                        base[f] = rec[f]
+                # flow_start: min
+                fs_old, fs_new = base.get("flow_start"), rec.get("flow_start")
+                if fs_old and fs_new:
+                    base["flow_start"] = min(fs_old, fs_new)
+                elif fs_new:
+                    base["flow_start"] = fs_new
+                # flow_end: max
+                fe_old, fe_new = base.get("flow_end"), rec.get("flow_end")
+                if fe_old and fe_new:
+                    base["flow_end"] = max(fe_old, fe_new)
+                elif fe_new:
+                    base["flow_end"] = fe_new
+            merged[cid] = base
 
     raw_sessions = list(merged.values())
     logger.info("load_session_gold 완료 — %d 세션", len(raw_sessions))
@@ -692,7 +713,6 @@ def load_session_gold(**ctx) -> None:
 
     ctx["ti"].xcom_push(key="raw_sessions_s3_key", value=tmp_key)
     ctx["ti"].xcom_push(key="total_loaded",         value=len(raw_sessions))
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Task 2 : filter_whitelist
