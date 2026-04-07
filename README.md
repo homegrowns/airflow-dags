@@ -11,7 +11,7 @@ repo-root/
     ├── __init__.py
     └── security_logic/
         ├── __init__.py
-        └── mappings.py     # CATEGORY_TO_CLASSTYPE 등 위치
+        └── mappings.py     # CATEGORY_TO_CLASSTYPE , CLASSTYPE_SCORE_RANGE 등 위치
 
 | DAG | 스케줄 | 역할 |
 |---|---|---|
