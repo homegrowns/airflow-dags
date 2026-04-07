@@ -483,7 +483,7 @@ def _calc_suspicion_score(session: dict, repeat_count: int = 1) -> int:
                 pass
 
     highest_ct = max(
-        classtypes, key=lambda c: _CLASSTYPE_RANK.get(c, 0), default="unknown"
+        classtypes, key=lambda c: CLASSTYPE_RANK.get(c, 0), default="unknown"
     )
     highest_sev = min(severities) if severities else 4
 
