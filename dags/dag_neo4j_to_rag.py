@@ -64,33 +64,38 @@ from airflow import DAG
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator
 from airflow.decorators import task
-from security_metadata.mappings import CATEGORY_TO_CLASSTYPE, CLASSTYPE_SCORE_RANGE, CLASSTYPE_RANK
+from security_metadata.mappings import (
+    CATEGORY_TO_CLASSTYPE,
+    CLASSTYPE_SCORE_RANGE,
+    CLASSTYPE_RANK,
+)
 
 logger = logging.getLogger(__name__)
 
 KST = ZoneInfo("Asia/Seoul")
 
-S3_BUCKET              = "malware-project-bucket"
+S3_BUCKET = "malware-project-bucket"
 S3_SESSION_GOLD_PREFIX = "gold/session_gold/"
-S3_RAG_PREFIX          = "rag_result"
-S3_TMP_PREFIX          = "tmp/neo4j_to_rag"
-AWS_REGION             = "ap-northeast-2"
+S3_RAG_PREFIX = "rag_result"
+S3_TMP_PREFIX = "tmp/neo4j_to_rag"
+AWS_REGION = "ap-northeast-2"
 
-NEO4J_BATCH_SIZE    = 50
-GROQ_RPM_SLEEP      = 2.0
-GROQ_MODEL_DEFAULT  = "llama-3.3-70b-versatile"
+NEO4J_BATCH_SIZE = 50
+GROQ_RPM_SLEEP = 2.0
+GROQ_MODEL_DEFAULT = "llama-3.3-70b-versatile"
 GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"
 
 S3_WRITE_WORKERS = 2
 
 # ── Dynamic Task Mapping 설정 ──────────────────────────────────────────────────
-CHUNK_SIZE   = 300   # 청크당 세션 수 (= 파드당 처리량)
-MAX_MAP_SIZE = 32    # Airflow Dynamic Task 최대 수 (안전 상한)
+CHUNK_SIZE = 300  # 청크당 세션 수 (= 파드당 처리량)
+MAX_MAP_SIZE = 32  # Airflow Dynamic Task 최대 수 (안전 상한)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 공통 헬퍼
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def _s3_client():
     return boto3.client("s3", region_name=AWS_REGION)
@@ -98,14 +103,16 @@ def _s3_client():
 
 def _neo4j_driver():
     from neo4j import GraphDatabase
-    uri  = Variable.get("NEO4J_URI")
+
+    uri = Variable.get("NEO4J_URI")
     user = Variable.get("NEO4J_USER")
-    pw   = Variable.get("NEO4J_PASSWORD")
+    pw = Variable.get("NEO4J_PASSWORD")
     return GraphDatabase.driver(uri, auth=(user, pw))
 
 
 def _groq_client():
     from groq import Groq
+
     return Groq(api_key=Variable.get("GROQ_API_KEY"), max_retries=1, timeout=10.0)
 
 
@@ -141,7 +148,11 @@ def _ms_to_kst_iso(ms: Any) -> str | None:
         except Exception:
             return ms
     try:
-        return datetime.fromtimestamp(int(ms) / 1000.0, tz=timezone.utc).astimezone(KST).isoformat()
+        return (
+            datetime.fromtimestamp(int(ms) / 1000.0, tz=timezone.utc)
+            .astimezone(KST)
+            .isoformat()
+        )
     except Exception:
         return str(ms)
 
@@ -150,15 +161,19 @@ def _ms_to_kst_iso(ms: Any) -> str | None:
 # S3 tmp 읽기/쓰기 헬퍼
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def _s3_tmp_key(run_id: str, stage: str) -> str:
-    safe_run_id = re.sub(r'[^a-zA-Z0-9_\-.]', '-', run_id)
+    safe_run_id = re.sub(r"[^a-zA-Z0-9_\-.]", "-", run_id)
     return f"{S3_TMP_PREFIX}/{safe_run_id}/{stage}.json"
 
 
 def _s3_write_json(s3_key: str, data: Any) -> None:
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
     _s3_client().put_object(
-        Bucket=S3_BUCKET, Key=s3_key, Body=body, ContentType="application/json",
+        Bucket=S3_BUCKET,
+        Key=s3_key,
+        Body=body,
+        ContentType="application/json",
     )
     logger.info("_s3_write_json: s3://%s/%s (%d bytes)", S3_BUCKET, s3_key, len(body))
 
@@ -182,8 +197,9 @@ def _s3_delete(s3_key: str) -> None:
 # session_gold S3 경로 헬퍼
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def _list_session_gold_keys(prefix: str) -> list[str]:
-    s3        = _s3_client()
+    s3 = _s3_client()
     paginator = s3.get_paginator("list_objects_v2")
     keys: list[str] = []
     for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
@@ -195,29 +211,29 @@ def _list_session_gold_keys(prefix: str) -> list[str]:
 
 
 def _parse_gold_partition(prefix: str) -> dict[str, str]:
-    dt_m     = re.search(r"dt=([^/]+)",          prefix)
-    hour_m   = re.search(r"hour=(\d+)",           prefix)
+    dt_m = re.search(r"dt=([^/]+)", prefix)
+    hour_m = re.search(r"hour=(\d+)", prefix)
     minute_m = re.search(r"minute(?:_10)?=(\d+)", prefix)
 
     if dt_m and hour_m and minute_m:
         return {
-            "dt":     dt_m.group(1),
-            "hour":   hour_m.group(1),
+            "dt": dt_m.group(1),
+            "hour": hour_m.group(1),
             "minute": minute_m.group(1),
         }
 
     now = datetime.now(tz=KST)
     logger.warning("_parse_gold_partition: 파싱 실패 — KST 현재값 fallback")
     return {
-        "dt":     now.strftime("%Y-%m-%d"),
-        "hour":   str(now.hour),
+        "dt": now.strftime("%Y-%m-%d"),
+        "hour": str(now.hour),
         "minute": str((now.minute // 10) * 10),
     }
 
 
 def _build_rag_s3_key(partition: dict[str, str]) -> str:
-    dt     = partition["dt"]
-    hour   = int(partition["hour"])
+    dt = partition["dt"]
+    hour = int(partition["hour"])
     minute = int(partition["minute"])
     return (
         f"{S3_RAG_PREFIX}/"
@@ -230,12 +246,13 @@ def _build_rag_s3_key(partition: dict[str, str]) -> str:
 # S3StreamingWriter (단일 청크 내 write용)
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class _S3StreamingWriter:
     def __init__(self, s3_key: str):
-        self._s3_key           = s3_key
+        self._s3_key = s3_key
         self._lines: list[str] = []
-        self._lock             = threading.Lock()
-        self._write_errors: list[str]    = []
+        self._lock = threading.Lock()
+        self._write_errors: list[str] = []
         self._checkpoint_keys: list[str] = []
         self._executor = ThreadPoolExecutor(
             max_workers=S3_WRITE_WORKERS,
@@ -279,7 +296,9 @@ class _S3StreamingWriter:
                 )
                 logger.info(
                     "_S3StreamingWriter.finish: s3://%s/%s → %d 건 업로드",
-                    S3_BUCKET, self._s3_key, len(lines_snapshot),
+                    S3_BUCKET,
+                    self._s3_key,
+                    len(lines_snapshot),
                 )
             except Exception as e:
                 logger.error("_S3StreamingWriter.finish: 업로드 실패 — %s", e)
@@ -295,8 +314,10 @@ class _S3StreamingWriter:
         )
         try:
             _s3_client().put_object(
-                Bucket=S3_BUCKET, Key=ck_key,
-                Body=(line + "\n").encode("utf-8"), ContentType="application/jsonl",
+                Bucket=S3_BUCKET,
+                Key=ck_key,
+                Body=(line + "\n").encode("utf-8"),
+                ContentType="application/jsonl",
             )
             with self._lock:
                 self._checkpoint_keys.append(ck_key)
@@ -308,7 +329,7 @@ class _S3StreamingWriter:
             keys = list(self._checkpoint_keys)
         if not keys:
             return
-        s3    = _s3_client()
+        s3 = _s3_client()
         BATCH = 1000
         deleted_total = 0
         for i in range(0, len(keys), BATCH):
@@ -323,38 +344,48 @@ class _S3StreamingWriter:
                 for err in errors:
                     logger.warning(
                         "_cleanup_checkpoints: 삭제 실패 — key=%s code=%s",
-                        err.get("Key"), err.get("Code"),
+                        err.get("Key"),
+                        err.get("Code"),
                     )
             except Exception as e:
                 logger.warning("_cleanup_checkpoints: batch 삭제 오류 — %s", e)
         logger.info(
             "_cleanup_checkpoints: 체크포인트 %d/%d 건 삭제 완료",
-            deleted_total, len(keys),
+            deleted_total,
+            len(keys),
         )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # whitelist 로직
-# TODO 
+# TODO
 # SUSPICION_THRESHOLD -> Airflow web variable로 관리 추가
 # WHITELIST_IPS -> Configmap으로 관리 추가
 # WHITELIST_CIDRS -> Configmap으로 관리 추가
 # ══════════════════════════════════════════════════════════════════════════════
 
 WHITELIST_IPS: set[str] = {
-    "10.0.0.1", "10.0.0.2", "192.168.0.1", "192.168.0.10",
+    "10.0.0.1",
+    "10.0.0.2",
+    "192.168.0.1",
+    "192.168.0.10",
 }
 WHITELIST_CIDRS: list[str] = ["10.0.2.0/24"]
-SUSPICION_THRESHOLD = 30 
+SUSPICION_THRESHOLD = 30
 
 
 def _in_whitelist(ip: str | None) -> bool:
-    if not ip: return False
-    if ip in WHITELIST_IPS: return True
+    if not ip:
+        return False
+    if ip in WHITELIST_IPS:
+        return True
     import ipaddress
+
     try:
         addr = ipaddress.ip_address(ip)
-        return any(addr in ipaddress.ip_network(c, strict=False) for c in WHITELIST_CIDRS)
+        return any(
+            addr in ipaddress.ip_network(c, strict=False) for c in WHITELIST_CIDRS
+        )
     except ValueError:
         return False
 
@@ -363,31 +394,39 @@ def _is_whitelisted_session(session: dict) -> bool:
     if session.get("src_ip") is not None:
         return _in_whitelist(session["src_ip"])
     for ev in session.get("timeline", []):
-        if ev.get("source") == "zeek_conn":  return _in_whitelist(ev.get("orig_h"))
-        if ev.get("source") == "suricata":   return _in_whitelist(ev.get("src_ip"))
+        if ev.get("source") == "zeek_conn":
+            return _in_whitelist(ev.get("orig_h"))
+        if ev.get("source") == "suricata":
+            return _in_whitelist(ev.get("src_ip"))
     return False
 
 
 def _get_session_src_ip(session: dict) -> str | None:
-    if session.get("src_ip") is not None: return session["src_ip"]
+    if session.get("src_ip") is not None:
+        return session["src_ip"]
     for ev in session.get("timeline", []):
-        if ev.get("source") == "zeek_conn" and ev.get("orig_h"): return ev["orig_h"]
+        if ev.get("source") == "zeek_conn" and ev.get("orig_h"):
+            return ev["orig_h"]
     for ev in session.get("timeline", []):
-        if ev.get("source") == "suricata"  and ev.get("src_ip"): return ev["src_ip"]
+        if ev.get("source") == "suricata" and ev.get("src_ip"):
+            return ev["src_ip"]
     return None
 
 
 def _get_session_flow_start(session: dict) -> float | None:
     ts = session.get("flow_start")
-    if not ts: return None
+    if not ts:
+        return None
     if isinstance(ts, (int, float)):
         v = float(ts)
         return v / 1000.0 if v > 1e10 else v
     try:
         s = str(ts).replace(" ", "T")
-        if s.endswith("Z"): s = s[:-1] + "+00:00"
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
         dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None: dt = dt.replace(tzinfo=KST)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=KST)
         return dt.astimezone(timezone.utc).timestamp()
     except Exception:
         return None
@@ -398,13 +437,14 @@ REPEAT_WINDOW_SEC = 10
 
 def _build_repeat_count_map(sessions: list[dict]) -> dict[str, int]:
     from collections import defaultdict
-    ip_ts:     dict[str, list[float]] = defaultdict(list)
-    cid_to_ip: dict[str, str]         = {}
+
+    ip_ts: dict[str, list[float]] = defaultdict(list)
+    cid_to_ip: dict[str, str] = {}
 
     for sess in sessions:
         src_ip = _get_session_src_ip(sess)
-        ts     = _get_session_flow_start(sess)
-        cid    = str(sess.get("community_id") or id(sess))
+        ts = _get_session_flow_start(sess)
+        cid = str(sess.get("community_id") or id(sess))
         if src_ip and ts is not None:
             ip_ts[src_ip].append(ts)
             cid_to_ip[cid] = src_ip
@@ -421,7 +461,7 @@ def _build_repeat_count_map(sessions: list[dict]) -> dict[str, int]:
 
     result: dict[str, int] = {}
     for sess in sessions:
-        cid    = str(sess.get("community_id") or id(sess))
+        cid = str(sess.get("community_id") or id(sess))
         src_ip = cid_to_ip.get(cid)
         result[cid] = ip_max_count.get(src_ip, 1) if src_ip else 1
     return result
@@ -431,39 +471,63 @@ def _calc_suspicion_score(session: dict, repeat_count: int = 1) -> int:
     classtypes: list[str] = []
     severities: list[int] = []
     for ev in session.get("timeline", []):
-        if ev.get("source") != "suricata" or not ev.get("signature"): continue
+        if ev.get("source") != "suricata" or not ev.get("signature"):
+            continue
         ct = CATEGORY_TO_CLASSTYPE.get(ev.get("category", ""), "unknown")
         classtypes.append(ct)
         sev = ev.get("severity")
         if sev is not None:
-            try: severities.append(int(sev))
-            except (ValueError, TypeError): pass
+            try:
+                severities.append(int(sev))
+            except (ValueError, TypeError):
+                pass
 
-    highest_ct  = max(classtypes, key=lambda c: _CLASSTYPE_RANK.get(c, 0), default="unknown")
+    highest_ct = max(
+        classtypes, key=lambda c: _CLASSTYPE_RANK.get(c, 0), default="unknown"
+    )
     highest_sev = min(severities) if severities else 4
 
     def _ct_score(ct: str) -> int:
         HIGH = {
-            "web-application-attack", "trojan-activity", "command-and-control",
-            "misc-attack", "exploit-kit", "shellcode-detect", "targeted-activity",
-            "attempted-admin", "successful-admin", "credential-theft", "domain-c2",
+            "web-application-attack",
+            "trojan-activity",
+            "command-and-control",
+            "misc-attack",
+            "exploit-kit",
+            "shellcode-detect",
+            "targeted-activity",
+            "attempted-admin",
+            "successful-admin",
+            "credential-theft",
+            "domain-c2",
         }
         MID = {
-            "bad-unknown", "network-scan", "attempted-user", "successful-user",
-            "policy-violation", "attempted-dos", "denial-of-service",
-            "coin-mining", "social-engineering",
+            "bad-unknown",
+            "network-scan",
+            "attempted-user",
+            "successful-user",
+            "policy-violation",
+            "attempted-dos",
+            "denial-of-service",
+            "coin-mining",
+            "social-engineering",
         }
-        if ct in HIGH: return 30
-        if ct in MID:  return 20
-        if ct in {"not-suspicious", "unknown", "tcp-connection"}: return 5
+        if ct in HIGH:
+            return 30
+        if ct in MID:
+            return 20
+        if ct in {"not-suspicious", "unknown", "tcp-connection"}:
+            return 5
         return 10
 
     def _sev_score(s: int) -> int:
         return {1: 30, 2: 20, 3: 10}.get(s, 0)
 
     def _repeat_score(cnt: int) -> int:
-        if cnt >= 5: return 20
-        if cnt >= 3: return 10
+        if cnt >= 5:
+            return 20
+        if cnt >= 3:
+            return 10
         return 0
 
     return _ct_score(highest_ct) + _sev_score(highest_sev) + _repeat_score(repeat_count)
@@ -473,8 +537,9 @@ def _calc_suspicion_score(session: dict, repeat_count: int = 1) -> int:
 # RAG 추론 공통 헬퍼
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def _fix_json_escapes(raw: str) -> str:
-    return re.sub(r'\\x([0-9a-fA-F]{2})', lambda m: f'\\u00{m.group(1)}', raw)
+    return re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: f"\\u00{m.group(1)}", raw)
 
 
 def _parse_response(raw: str, suspicion_score: int = 0) -> dict:
@@ -581,7 +646,8 @@ Analyze and respond ONLY in this JSON format (no markdown, no explanation):
 def _subgraph_to_text(subgraph: dict) -> str:
     s = subgraph["session"]
     alerts = [
-        ev for ev in s.get("timeline", [])
+        ev
+        for ev in s.get("timeline", [])
         if ev.get("source") == "suricata" and ev.get("signature")
     ]
     lines = [
@@ -615,9 +681,12 @@ def _subgraph_to_text(subgraph: dict) -> str:
         for nb in neighbors:
             label = (nb.get("node_labels") or ["?"])[0]
             value = nb.get("node_value", "")
-            rel   = nb.get("rel_type", "")
-            extra = (f"  signature={nb['signature']}  category={nb.get('category')}"
-                     if nb.get("signature") else "")
+            rel = nb.get("rel_type", "")
+            extra = (
+                f"  signature={nb['signature']}  category={nb.get('category')}"
+                if nb.get("signature")
+                else ""
+            )
             lines.append(f"  -[{rel}]→ :{label} '{value}'{extra}")
     else:
         lines.append("[Neo4j 과거 행위] 없음 (신규 세션 또는 미수집)")
@@ -628,19 +697,24 @@ def _subgraph_to_text(subgraph: dict) -> str:
 # Task 0 : resolve_session_gold_prefix
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def resolve_session_gold_prefix(**ctx) -> None:
-    conf          = ctx["dag_run"].conf or {}
-    session_key   = conf.get("session_key", "")
+    conf = ctx["dag_run"].conf or {}
+    session_key = conf.get("session_key", "")
     source_run_id = conf.get("source_run_id", "unknown")
 
     logger.info("resolve_session_gold_prefix: source_run_id = %s", source_run_id)
 
     if session_key:
         prefix = session_key.rsplit("/", 1)[0] + "/"
-        logger.info("resolve_session_gold_prefix: conf session_key → prefix = %s", prefix)
+        logger.info(
+            "resolve_session_gold_prefix: conf session_key → prefix = %s", prefix
+        )
     else:
-        logger.warning("resolve_session_gold_prefix: conf 없음 — S3 최신 _SUCCESS fallback")
-        s3        = _s3_client()
+        logger.warning(
+            "resolve_session_gold_prefix: conf 없음 — S3 최신 _SUCCESS fallback"
+        )
+        s3 = _s3_client()
         paginator = s3.get_paginator("list_objects_v2")
 
         success_keys: list[tuple[datetime, str]] = []
@@ -661,24 +735,30 @@ def resolve_session_gold_prefix(**ctx) -> None:
     logger.info("resolve_session_gold_prefix: partition = %s", partition)
 
     ctx["ti"].xcom_push(key="session_gold_prefix", value=prefix)
-    ctx["ti"].xcom_push(key="gold_partition",       value=partition)
+    ctx["ti"].xcom_push(key="gold_partition", value=partition)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Task 1 : load_session_gold
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def load_session_gold(**ctx) -> None:
     import pandas as pd
 
     run_id: str = ctx["run_id"]
 
-    prefix: str = ctx["ti"].xcom_pull(
-        task_ids="resolve_session_gold_prefix", key="session_gold_prefix",
-    ) or S3_SESSION_GOLD_PREFIX
+    prefix: str = (
+        ctx["ti"].xcom_pull(
+            task_ids="resolve_session_gold_prefix",
+            key="session_gold_prefix",
+        )
+        or S3_SESSION_GOLD_PREFIX
+    )
 
     partition = ctx["ti"].xcom_pull(
-        task_ids="resolve_session_gold_prefix", key="gold_partition",
+        task_ids="resolve_session_gold_prefix",
+        key="gold_partition",
     ) or _parse_gold_partition(prefix)
 
     ctx["ti"].xcom_push(key="gold_partition", value=partition)
@@ -702,7 +782,9 @@ def load_session_gold(**ctx) -> None:
 
     df = pd.concat(frames, ignore_index=True)
     logger.info("load_session_gold: %d 행 로드", len(df))
-    df = df.drop(columns=[c for c in ("dt", "hour", "batch_seq", "minute_10") if c in df.columns])
+    df = df.drop(
+        columns=[c for c in ("dt", "hour", "batch_seq", "minute_10") if c in df.columns]
+    )
 
     # ── flow_start / flow_end KST 변환 (벡터화) ──────────────────────────────
     for col in ("flow_start", "flow_end"):
@@ -743,13 +825,22 @@ def load_session_gold(**ctx) -> None:
 
     # ── community_id 기준 병합 ────────────────────────────────────────────────
     NUMERIC_FIELDS = {
-        "uid", "flow_id", "src_ip", "src_port", "dest_ip", "dest_port",
-        "proto", "service", "is_threat", "alert_count", "threat_level",
+        "uid",
+        "flow_id",
+        "src_ip",
+        "src_port",
+        "dest_ip",
+        "dest_port",
+        "proto",
+        "service",
+        "is_threat",
+        "alert_count",
+        "threat_level",
     }
 
     has_cid = df["community_id"].notna() & (df["community_id"] != "")
     orphans = df[~has_cid].copy()
-    df_cid  = df[has_cid].copy()
+    df_cid = df[has_cid].copy()
 
     merged: dict[str, dict] = {}
 
@@ -788,12 +879,13 @@ def load_session_gold(**ctx) -> None:
     _s3_write_json(tmp_key, raw_sessions)
 
     ctx["ti"].xcom_push(key="raw_sessions_s3_key", value=tmp_key)
-    ctx["ti"].xcom_push(key="total_loaded",         value=len(raw_sessions))
+    ctx["ti"].xcom_push(key="total_loaded", value=len(raw_sessions))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Task 2 : filter_whitelist
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def filter_whitelist(**ctx) -> None:
     run_id: str = ctx["run_id"]
@@ -804,16 +896,16 @@ def filter_whitelist(**ctx) -> None:
     raw_sessions: list[dict] = _s3_read_json(raw_sessions_key)
 
     repeat_map = _build_repeat_count_map(raw_sessions)
-    passed:   list[dict]     = []
+    passed: list[dict] = []
     filtered: dict[str, int] = {"whitelist_ip": 0, "low_score": 0}
 
     for sess in raw_sessions:
         if _is_whitelisted_session(sess):
             filtered["whitelist_ip"] += 1
             continue
-        cid          = str(sess.get("community_id") or id(sess))
+        cid = str(sess.get("community_id") or id(sess))
         repeat_count = repeat_map.get(cid, 1)
-        score        = _calc_suspicion_score(sess, repeat_count=repeat_count)
+        score = _calc_suspicion_score(sess, repeat_count=repeat_count)
         if score < SUSPICION_THRESHOLD:
             filtered["low_score"] += 1
             continue
@@ -822,8 +914,10 @@ def filter_whitelist(**ctx) -> None:
 
     logger.info(
         "filter_whitelist: 전체 %d → 통과 %d (화이트리스트 %d, 저점수 %d)",
-        len(raw_sessions), len(passed),
-        filtered["whitelist_ip"], filtered["low_score"],
+        len(raw_sessions),
+        len(passed),
+        filtered["whitelist_ip"],
+        filtered["low_score"],
     )
 
     tmp_key = _s3_tmp_key(run_id, "filtered_sessions")
@@ -831,12 +925,13 @@ def filter_whitelist(**ctx) -> None:
     _s3_delete(raw_sessions_key)
 
     ctx["ti"].xcom_push(key="filtered_sessions_s3_key", value=tmp_key)
-    ctx["ti"].xcom_push(key="filter_stats",              value=filtered)
+    ctx["ti"].xcom_push(key="filter_stats", value=filtered)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Task 3 : build_subgraphs
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def build_subgraphs(**ctx) -> None:
     run_id: str = ctx["run_id"]
@@ -857,7 +952,7 @@ def build_subgraphs(**ctx) -> None:
         if not sess.get("session_id"):
             sess["session_id"] = _make_session_id(sess.get("community_id"), idx)
 
-    sess_index  = {s["session_id"]: s for s in sessions}
+    sess_index = {s["session_id"]: s for s in sessions}
     session_ids = list(sess_index.keys())
     neighbor_map: dict[str, list[dict]] = {sid: [] for sid in session_ids}
 
@@ -882,31 +977,42 @@ def build_subgraphs(**ctx) -> None:
     driver = _neo4j_driver()
     with driver.session() as neo_sess:
         for i in range(0, len(session_ids), NEO4J_BATCH_SIZE):
-            batch  = session_ids[i : i + NEO4J_BATCH_SIZE]
+            batch = session_ids[i : i + NEO4J_BATCH_SIZE]
             result = neo_sess.run(batch_query, session_ids=batch)
             for record in result:
                 sid = record["session_id"]
-                neighbor_map[sid].append({
-                    "rel_type":              record["rel_type"],
-                    "node_labels":           record["node_labels"],
-                    "node_value":            record["node_value"],
-                    "signature":             record["signature"],
-                    "category":              record["category"],
-                    "first_seen":            str(record["first_seen"]) if record["first_seen"] else None,
-                    "last_seen":             str(record["last_seen"])  if record["last_seen"]  else None,
-                    "related_session_count": record["related_session_count"],
-                    "total_orig_bytes":      record["total_orig_bytes"],
-                    "total_resp_bytes":      record["total_resp_bytes"],
-                })
+                neighbor_map[sid].append(
+                    {
+                        "rel_type": record["rel_type"],
+                        "node_labels": record["node_labels"],
+                        "node_value": record["node_value"],
+                        "signature": record["signature"],
+                        "category": record["category"],
+                        "first_seen": (
+                            str(record["first_seen"]) if record["first_seen"] else None
+                        ),
+                        "last_seen": (
+                            str(record["last_seen"]) if record["last_seen"] else None
+                        ),
+                        "related_session_count": record["related_session_count"],
+                        "total_orig_bytes": record["total_orig_bytes"],
+                        "total_resp_bytes": record["total_resp_bytes"],
+                    }
+                )
                 total_edges += 1
     driver.close()
 
-    subgraphs = [{"session": sess_index[sid], "neighbors": neighbor_map[sid]}
-                 for sid in session_ids]
+    subgraphs = [
+        {"session": sess_index[sid], "neighbors": neighbor_map[sid]}
+        for sid in session_ids
+    ]
     neo4j_hit = sum(1 for sid in session_ids if neighbor_map[sid])
     logger.info(
         "build_subgraphs 완료 — 세션 %d개 | Neo4j 매칭 %d개 (%d 엣지) | 신규 %d개",
-        len(subgraphs), neo4j_hit, total_edges, len(subgraphs) - neo4j_hit,
+        len(subgraphs),
+        neo4j_hit,
+        total_edges,
+        len(subgraphs) - neo4j_hit,
     )
 
     tmp_key = _s3_tmp_key(run_id, "subgraphs")
@@ -920,6 +1026,7 @@ def build_subgraphs(**ctx) -> None:
 # Task 4 : split_subgraphs  ← Dynamic Task Mapping 준비
 # 서브그래프를 CHUNK_SIZE개씩 S3에 저장하고 chunk_key 리스트를 반환
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 @task
 def split_subgraphs(**ctx) -> list[dict]:
@@ -935,9 +1042,9 @@ def split_subgraphs(**ctx) -> list[dict]:
     )
     subgraphs: list[dict] = _s3_read_json(subgraphs_key)
 
-    partition: dict = ctx["ti"].xcom_pull(
-        task_ids="load_session_gold", key="gold_partition"
-    ) or {}
+    partition: dict = (
+        ctx["ti"].xcom_pull(task_ids="load_session_gold", key="gold_partition") or {}
+    )
 
     if not subgraphs:
         logger.warning("split_subgraphs: 처리할 서브그래프 없음 — 빈 청크 1개 생성")
@@ -948,29 +1055,31 @@ def split_subgraphs(**ctx) -> list[dict]:
 
     # 300개씩 분할
     chunks = [
-        subgraphs[i : i + CHUNK_SIZE]
-        for i in range(0, len(subgraphs), CHUNK_SIZE)
+        subgraphs[i : i + CHUNK_SIZE] for i in range(0, len(subgraphs), CHUNK_SIZE)
     ]
     # 안전 상한 적용
     if len(chunks) > MAX_MAP_SIZE:
         logger.warning(
             "split_subgraphs: 청크 수 %d > MAX_MAP_SIZE %d — 마지막 청크들 합산",
-            len(chunks), MAX_MAP_SIZE,
+            len(chunks),
+            MAX_MAP_SIZE,
         )
         overflow = []
-        for c in chunks[MAX_MAP_SIZE - 1:]:
+        for c in chunks[MAX_MAP_SIZE - 1 :]:
             overflow.extend(c)
-        chunks = chunks[:MAX_MAP_SIZE - 1] + [overflow]
+        chunks = chunks[: MAX_MAP_SIZE - 1] + [overflow]
 
     chunk_infos: list[dict] = []
     for idx, chunk in enumerate(chunks):
         chunk_key = _s3_tmp_key(run_id, f"chunk_{idx}")
         _s3_write_json(chunk_key, chunk)
-        chunk_infos.append({
-            "chunk_key": chunk_key,
-            "chunk_idx": idx,
-            "partition": partition,
-        })
+        chunk_infos.append(
+            {
+                "chunk_key": chunk_key,
+                "chunk_idx": idx,
+                "partition": partition,
+            }
+        )
         logger.info("split_subgraphs: 청크[%d] %d개 → %s", idx, len(chunk), chunk_key)
 
     _s3_delete(subgraphs_key)
@@ -982,6 +1091,7 @@ def split_subgraphs(**ctx) -> list[dict]:
 # Task 5 : run_rag_chunk  ← Dynamic Task Mapping 실행 단위 (파드 1개)
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @task
 def run_rag_chunk(chunk_info: dict) -> dict:
     """
@@ -991,29 +1101,29 @@ def run_rag_chunk(chunk_info: dict) -> dict:
     """
     from groq import RateLimitError
 
-    chunk_key  = chunk_info["chunk_key"]
-    chunk_idx  = chunk_info["chunk_idx"]
-    partition  = chunk_info["partition"]
+    chunk_key = chunk_info["chunk_key"]
+    chunk_idx = chunk_info["chunk_idx"]
+    partition = chunk_info["partition"]
 
     subgraphs: list[dict] = _s3_read_json(chunk_key)
 
     # 청크 결과를 별도 S3 키에 저장 (merge 단계에서 합침)
-    safe_key   = chunk_key.replace(".json", "_result.jsonl")
-    writer     = _S3StreamingWriter(safe_key)
+    safe_key = chunk_key.replace(".json", "_result.jsonl")
+    writer = _S3StreamingWriter(safe_key)
     writer.start()
 
-    groq         = _groq_client()
-    model        = _groq_model()
+    groq = _groq_client()
+    model = _groq_model()
     use_fallback = False
     inference_dt = _now_kst_iso()
-    error_count  = 0
+    error_count = 0
     threat_dist: dict[str, int] = {}
 
     logger.info("run_rag_chunk[%d]: %d개 처리 시작", chunk_idx, len(subgraphs))
 
     for i, sg in enumerate(subgraphs):
-        session_id    = sg["session"].get("session_id", f"c{chunk_idx}_u{i}")
-        user_text     = _subgraph_to_text(sg)
+        session_id = sg["session"].get("session_id", f"c{chunk_idx}_u{i}")
+        user_text = _subgraph_to_text(sg)
         current_model = GROQ_FALLBACK_MODEL if use_fallback else model
 
         def _call(mdl: str):
@@ -1021,7 +1131,7 @@ def run_rag_chunk(chunk_info: dict) -> dict:
                 model=mdl,
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user",   "content": user_text},
+                    {"role": "user", "content": user_text},
                 ],
                 temperature=0.1,
                 max_tokens=1024,
@@ -1029,17 +1139,19 @@ def run_rag_chunk(chunk_info: dict) -> dict:
 
         def _write(response) -> None:
             nonlocal error_count
-            raw             = response.choices[0].message.content.strip()
+            raw = response.choices[0].message.content.strip()
             suspicion_score = sg["session"].get("suspicion_score", 0)
-            analysis        = _parse_response(raw, suspicion_score)
-            writer.put({
-                "session_id":         session_id,
-                "uid":                sg["session"].get("uid"),
-                "inference_datetime": inference_dt,
-                "session":            sg["session"],
-                "analysis":           analysis,
-                "neighbors":          sg.get("neighbors", []),
-            })
+            analysis = _parse_response(raw, suspicion_score)
+            writer.put(
+                {
+                    "session_id": session_id,
+                    "uid": sg["session"].get("uid"),
+                    "inference_datetime": inference_dt,
+                    "session": sg["session"],
+                    "analysis": analysis,
+                    "neighbors": sg.get("neighbors", []),
+                }
+            )
             if analysis.get("parse_error") or analysis.get("error"):
                 error_count += 1
             else:
@@ -1053,59 +1165,81 @@ def run_rag_chunk(chunk_info: dict) -> dict:
             if not use_fallback:
                 logger.warning(
                     "run_rag_chunk[%d] session=%s RateLimit — 60초 대기 후 fallback",
-                    chunk_idx, session_id,
+                    chunk_idx,
+                    session_id,
                 )
                 use_fallback = True
                 time.sleep(60)
             else:
                 logger.warning(
                     "run_rag_chunk[%d] session=%s fallback RateLimit — 2초 대기",
-                    chunk_idx, session_id,
+                    chunk_idx,
+                    session_id,
                 )
                 time.sleep(2)
             try:
                 _write(_call(GROQ_FALLBACK_MODEL))
             except Exception as e2:
-                logger.error("run_rag_chunk[%d] session=%s fallback 실패 — %s", chunk_idx, session_id, e2)
-                writer.put({
-                    "session_id": session_id, "uid": sg["session"].get("uid"),
-                    "inference_datetime": inference_dt, "session": sg["session"],
-                    "analysis": {"error": str(e2)}, "neighbors": sg.get("neighbors", []),
-                })
+                logger.error(
+                    "run_rag_chunk[%d] session=%s fallback 실패 — %s",
+                    chunk_idx,
+                    session_id,
+                    e2,
+                )
+                writer.put(
+                    {
+                        "session_id": session_id,
+                        "uid": sg["session"].get("uid"),
+                        "inference_datetime": inference_dt,
+                        "session": sg["session"],
+                        "analysis": {"error": str(e2)},
+                        "neighbors": sg.get("neighbors", []),
+                    }
+                )
                 error_count += 1
 
         except Exception as e:
-            logger.error("run_rag_chunk[%d] session=%s 오류 — %s", chunk_idx, session_id, e)
-            writer.put({
-                "session_id": session_id, "uid": sg["session"].get("uid"),
-                "inference_datetime": inference_dt, "session": sg["session"],
-                "analysis": {"error": str(e)}, "neighbors": sg.get("neighbors", []),
-            })
+            logger.error(
+                "run_rag_chunk[%d] session=%s 오류 — %s", chunk_idx, session_id, e
+            )
+            writer.put(
+                {
+                    "session_id": session_id,
+                    "uid": sg["session"].get("uid"),
+                    "inference_datetime": inference_dt,
+                    "session": sg["session"],
+                    "analysis": {"error": str(e)},
+                    "neighbors": sg.get("neighbors", []),
+                }
+            )
             error_count += 1
 
         time.sleep(GROQ_RPM_SLEEP)
 
     saved_count, write_errors = writer.finish()
-    _s3_delete(chunk_key)   # 처리 완료된 청크 tmp 삭제
+    _s3_delete(chunk_key)  # 처리 완료된 청크 tmp 삭제
 
     logger.info(
         "run_rag_chunk[%d]: 완료 — 저장 %d건 | 오류 %d건",
-        chunk_idx, saved_count, error_count,
+        chunk_idx,
+        saved_count,
+        error_count,
     )
 
     return {
-        "result_key":  safe_key,
-        "chunk_idx":   chunk_idx,
-        "saved":       saved_count,
-        "errors":      error_count,
+        "result_key": safe_key,
+        "chunk_idx": chunk_idx,
+        "saved": saved_count,
+        "errors": error_count,
         "threat_dist": threat_dist,
-        "partition":   partition,
+        "partition": partition,
     }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Task 6 : merge_rag_results  ← 각 청크 결과 JSONL 병합
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 @task
 def merge_rag_results(chunk_results: list[dict], **ctx) -> None:
@@ -1117,30 +1251,34 @@ def merge_rag_results(chunk_results: list[dict], **ctx) -> None:
         return
 
     # partition은 모든 청크가 동일 → 첫 번째에서 가져옴
-    partition   = chunk_results[0].get("partition", {})
-    final_key   = _build_rag_s3_key(partition)
-    s3          = _s3_client()
+    partition = chunk_results[0].get("partition", {})
+    final_key = _build_rag_s3_key(partition)
+    s3 = _s3_client()
 
-    all_lines:   list[str] = []
-    total_saved  = 0
+    all_lines: list[str] = []
+    total_saved = 0
     total_errors = 0
     threat_dist: dict[str, int] = {}
 
     for cr in sorted(chunk_results, key=lambda x: x["chunk_idx"]):
         result_key = cr["result_key"]
         try:
-            obj  = s3.get_object(Bucket=S3_BUCKET, Key=result_key)
+            obj = s3.get_object(Bucket=S3_BUCKET, Key=result_key)
             body = obj["Body"].read().decode("utf-8")
             lines = [l for l in body.splitlines() if l.strip()]
             all_lines.extend(lines)
             logger.info(
                 "merge_rag_results: 청크[%d] %d줄 읽음 ← %s",
-                cr["chunk_idx"], len(lines), result_key,
+                cr["chunk_idx"],
+                len(lines),
+                result_key,
             )
         except Exception as e:
-            logger.error("merge_rag_results: 청크[%d] 읽기 실패 — %s", cr["chunk_idx"], e)
+            logger.error(
+                "merge_rag_results: 청크[%d] 읽기 실패 — %s", cr["chunk_idx"], e
+            )
 
-        total_saved  += cr.get("saved", 0)
+        total_saved += cr.get("saved", 0)
         total_errors += cr.get("errors", 0)
         for tt, cnt in cr.get("threat_dist", {}).items():
             threat_dist[tt] = threat_dist.get(tt, 0) + cnt
@@ -1159,19 +1297,23 @@ def merge_rag_results(chunk_results: list[dict], **ctx) -> None:
         )
         logger.info(
             "merge_rag_results: 최종 병합 완료 — %d건 → s3://%s/%s",
-            len(all_lines), S3_BUCKET, final_key,
+            len(all_lines),
+            S3_BUCKET,
+            final_key,
         )
 
     # 통계 XCom 저장
-    ctx["ti"].xcom_push(key="saved_s3_key",      value=final_key)
-    ctx["ti"].xcom_push(key="saved_count",        value=total_saved)
+    ctx["ti"].xcom_push(key="saved_s3_key", value=final_key)
+    ctx["ti"].xcom_push(key="saved_count", value=total_saved)
     ctx["ti"].xcom_push(key="inference_datetime", value=_now_kst_iso())
-    ctx["ti"].xcom_push(key="error_count",        value=total_errors)
-    ctx["ti"].xcom_push(key="threat_dist",        value=threat_dist)
+    ctx["ti"].xcom_push(key="error_count", value=total_errors)
+    ctx["ti"].xcom_push(key="threat_dist", value=threat_dist)
 
     logger.info(
         "merge_rag_results: 총 저장 %d건 | 오류 %d건 | 위협 유형 %d종",
-        total_saved, total_errors, len(threat_dist),
+        total_saved,
+        total_errors,
+        len(threat_dist),
     )
 
 
@@ -1179,23 +1321,30 @@ def merge_rag_results(chunk_results: list[dict], **ctx) -> None:
 # Task 7 : report_rag_stats
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def report_rag_stats(**ctx) -> None:
     ti = ctx["ti"]
 
-    total_loaded = ti.xcom_pull(task_ids="load_session_gold", key="total_loaded")          or 0
-    filter_stats = ti.xcom_pull(task_ids="filter_whitelist",  key="filter_stats")          or {}
-    saved_count  = ti.xcom_pull(task_ids="merge_rag_results", key="saved_count")           or 0
-    saved_key    = ti.xcom_pull(task_ids="merge_rag_results", key="saved_s3_key")          or "-"
-    inference_dt = ti.xcom_pull(task_ids="merge_rag_results", key="inference_datetime")    or "-"
-    error_count  = ti.xcom_pull(task_ids="merge_rag_results", key="error_count")           or 0
-    threat_dist  = ti.xcom_pull(task_ids="merge_rag_results", key="threat_dist")           or {}
+    total_loaded = ti.xcom_pull(task_ids="load_session_gold", key="total_loaded") or 0
+    filter_stats = ti.xcom_pull(task_ids="filter_whitelist", key="filter_stats") or {}
+    saved_count = ti.xcom_pull(task_ids="merge_rag_results", key="saved_count") or 0
+    saved_key = ti.xcom_pull(task_ids="merge_rag_results", key="saved_s3_key") or "-"
+    inference_dt = (
+        ti.xcom_pull(task_ids="merge_rag_results", key="inference_datetime") or "-"
+    )
+    error_count = ti.xcom_pull(task_ids="merge_rag_results", key="error_count") or 0
+    threat_dist = ti.xcom_pull(task_ids="merge_rag_results", key="threat_dist") or {}
 
     logger.info("=" * 70)
     logger.info("▶ neo4j_to_rag 추론 파이프라인 완료 요약 (v10)")
     logger.info("=" * 70)
     logger.info("  [입력]  session_gold 로드      : %d 세션", total_loaded)
-    logger.info("  [필터]  화이트리스트 제외       : %d", filter_stats.get("whitelist_ip", 0))
-    logger.info("  [필터]  저점수 제외             : %d", filter_stats.get("low_score", 0))
+    logger.info(
+        "  [필터]  화이트리스트 제외       : %d", filter_stats.get("whitelist_ip", 0)
+    )
+    logger.info(
+        "  [필터]  저점수 제외             : %d", filter_stats.get("low_score", 0)
+    )
     logger.info("  [추론]  inference_datetime      : %s (KST)", inference_dt)
     logger.info("  [저장]  S3 저장 건수            : %d", saved_count)
     logger.info("  [저장]  S3 경로                 : s3://%s/%s", S3_BUCKET, saved_key)
@@ -1211,10 +1360,10 @@ def report_rag_stats(**ctx) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 default_args = {
-    "owner":            "linda",
-    "depends_on_past":  False,
-    "retries":          1,
-    "retry_delay":      timedelta(minutes=3),
+    "owner": "linda",
+    "depends_on_past": False,
+    "retries": 1,
+    "retry_delay": timedelta(minutes=3),
     "email_on_failure": False,
 }
 
@@ -1229,15 +1378,35 @@ with DAG(
     tags=["graph-rag"],
 ) as dag:
 
-    t_resolve  = PythonOperator(task_id="resolve_session_gold_prefix", python_callable=resolve_session_gold_prefix)
-    t_load     = PythonOperator(task_id="load_session_gold",           python_callable=load_session_gold)
-    t_filter   = PythonOperator(task_id="filter_whitelist",            python_callable=filter_whitelist)
-    t_subgraph = PythonOperator(task_id="build_subgraphs",             python_callable=build_subgraphs)
-    t_report   = PythonOperator(task_id="report_rag_stats",            python_callable=report_rag_stats)
+    t_resolve = PythonOperator(
+        task_id="resolve_session_gold_prefix",
+        python_callable=resolve_session_gold_prefix,
+    )
+    t_load = PythonOperator(
+        task_id="load_session_gold", python_callable=load_session_gold
+    )
+    t_filter = PythonOperator(
+        task_id="filter_whitelist", python_callable=filter_whitelist
+    )
+    t_subgraph = PythonOperator(
+        task_id="build_subgraphs", python_callable=build_subgraphs
+    )
+    t_report = PythonOperator(
+        task_id="report_rag_stats", python_callable=report_rag_stats
+    )
 
     # Dynamic Task Mapping
-    t_split   = split_subgraphs()
-    t_chunks  = run_rag_chunk.expand(chunk_info=t_split)
-    t_merge   = merge_rag_results(chunk_results=t_chunks)
+    t_split = split_subgraphs()
+    t_chunks = run_rag_chunk.expand(chunk_info=t_split)
+    t_merge = merge_rag_results(chunk_results=t_chunks)
 
-    t_resolve >> t_load >> t_filter >> t_subgraph >> t_split >> t_chunks >> t_merge >> t_report
+    (
+        t_resolve
+        >> t_load
+        >> t_filter
+        >> t_subgraph
+        >> t_split
+        >> t_chunks
+        >> t_merge
+        >> t_report
+    )
