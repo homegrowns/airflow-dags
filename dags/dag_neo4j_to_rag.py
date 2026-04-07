@@ -335,13 +335,17 @@ class _S3StreamingWriter:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # whitelist 로직
+# TODO 
+# SUSPICION_THRESHOLD -> Airflow web variable로 관리 추가
+# WHITELIST_IPS -> Configmap으로 관리 추가
+# WHITELIST_CIDRS -> Configmap으로 관리 추가
 # ══════════════════════════════════════════════════════════════════════════════
 
 WHITELIST_IPS: set[str] = {
     "10.0.0.1", "10.0.0.2", "192.168.0.1", "192.168.0.10",
 }
 WHITELIST_CIDRS: list[str] = ["10.0.2.0/24"]
-SUSPICION_THRESHOLD = 30
+SUSPICION_THRESHOLD = 30 
 
 
 def _in_whitelist(ip: str | None) -> bool:
