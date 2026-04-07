@@ -1,0 +1,44 @@
+name: Airflow DAGs CI
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'dags/**'       # dags 폴더 변경 시에만 실행
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install apache-airflow pytest flake8 black
+          # 필요한 경우 실제 DAG에서 사용하는 라이브러리 설치
+
+      - name: Lint with Black & Flake8
+        run: |
+          black --check dags/
+          flake8 dags/ --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: DAG Integrity Test
+        run: |
+          # Airflow DB 없이 DAG가 파싱 가능한지 확인하는 테스트
+          export AIRFLOW__CORE__LOAD_EXAMPLES=False
+          pytest tests/test_dag_integrity.py
+
+      - name: Security Scan (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
