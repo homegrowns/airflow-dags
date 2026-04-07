@@ -76,6 +76,7 @@ from plugins.security_metadata.aws_config import (
     S3_RAG_PREFIX,
     S3_TMP_PREFIX,
     AWS_REGION,
+    S3_WRITE_WORKERS,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,8 +87,6 @@ NEO4J_BATCH_SIZE = 50
 GROQ_RPM_SLEEP = 2.0
 GROQ_MODEL_DEFAULT = "llama-3.3-70b-versatile"
 GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"
-
-S3_WRITE_WORKERS = 2
 
 # ── Dynamic Task Mapping 설정 ──────────────────────────────────────────────────
 CHUNK_SIZE = 300  # 청크당 세션 수 (= 파드당 처리량)
