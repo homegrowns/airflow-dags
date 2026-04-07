@@ -70,15 +70,17 @@ from plugins.security_metadata.mappings import (
     CLASSTYPE_RANK,
 )
 
+from plugins.security_metadata.aws_config import (
+    S3_BUCKET,
+    S3_SESSION_GOLD_PREFIX,
+    S3_RAG_PREFIX,
+    S3_TMP_PREFIX,
+    AWS_REGION,
+)
+
 logger = logging.getLogger(__name__)
 
 KST = ZoneInfo("Asia/Seoul")
-
-S3_BUCKET = "malware-project-bucket"
-S3_SESSION_GOLD_PREFIX = "gold/session_gold/"
-S3_RAG_PREFIX = "rag_result"
-S3_TMP_PREFIX = "tmp/neo4j_to_rag"
-AWS_REGION = "ap-northeast-2"
 
 NEO4J_BATCH_SIZE = 50
 GROQ_RPM_SLEEP = 2.0
