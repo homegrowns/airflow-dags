@@ -11,4 +11,3 @@ def test_dag_bag():
     # 2. 모든 DAG에 cycle(순환 참조)이 없는지 확인
     for dag_id, dag in dag_bag.dags.items():
         assert len(dag.tasks) > 0
-        # Airflow 2.x 이상은 자동으로 cycle을 체크하지만 명시적으로 추가 가능
