@@ -5,8 +5,10 @@ on:
     branches: [dev]
     paths:
       - 'dags/**'       # dags 폴더 변경 시에만 실행
+      - 'plugins/**'    # plugins 폴더 변경 시에만 실행
+      - '.github/workflows/airflow-dag-ci.yaml' # CI 설정 변경 시
   pull_request:
-    branches: [ dev ]
+    branches: [dev]
 
 jobs:
   ci:
