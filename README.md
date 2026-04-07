@@ -7,7 +7,9 @@ EKS Airflow DAG 모음 — 네트워크 위협 탐지 CTI 파이프라인
 ```
 repo-root/
 ├── dags/
-│   └── threat_analysis_dag.py
+│   ├── dag_unified_events_to_gold.py
+│   ├── dag_gold_to_neo4j.py
+│   └── dag_neo4j_to_rag.py
 └── plugins/                # git-sync가 이 폴더도 동기화하도록 설정
     ├── __init__.py
     └── security_logic/
