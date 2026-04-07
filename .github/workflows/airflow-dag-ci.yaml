@@ -2,11 +2,11 @@ name: Airflow DAGs CI
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [dev]
     paths:
       - 'dags/**'       # dags 폴더 변경 시에만 실행
   pull_request:
-    branches: [ main ]
+    branches: [ dev ]
 
 jobs:
   ci:
