@@ -1,6 +1,7 @@
 from typing import Final
 
-CATEGORY_TO_CLASSTYPE: dict[str, str] = {
+# 변경되지 않는 상수는 Final로 선언하여 Typing 강화
+CATEGORY_TO_CLASSTYPE: Final[dict[str, str]] = {
     "Web Application Attack":                          "web-application-attack",
     "A Network Trojan was detected":                   "trojan-activity",
     "Malware Command and Control Activity Detected":   "command-and-control",
@@ -46,7 +47,7 @@ CATEGORY_TO_CLASSTYPE: dict[str, str] = {
     "A TCP connection was detected":                   "tcp-connection",
 }
 
-CLASSTYPE_SCORE_RANGE: dict[str, tuple[int, int]] = {
+CLASSTYPE_SCORE_RANGE: Final[dict[str, tuple[int, int]]] = {
     "web-application-attack":         (70, 95),
     "trojan-activity":                (75, 95),
     "command-and-control":            (80, 100),
@@ -92,7 +93,7 @@ CLASSTYPE_SCORE_RANGE: dict[str, tuple[int, int]] = {
     "tcp-connection":                 (5,  20),
 }
 
-CLASSTYPE_RANK: dict[str, int] = {
+CLASSTYPE_RANK: Final[dict[str, int]] = {
     "web-application-attack": 3, "trojan-activity": 3,
     "command-and-control": 3,    "misc-attack": 3,
     "exploit-kit": 3,            "shellcode-detect": 3,
