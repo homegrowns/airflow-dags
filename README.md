@@ -4,6 +4,7 @@ EKS Airflow DAG 모음 — 네트워크 위협 탐지 CTI 파이프라인
 
 ## DAG 구성
 
+```
 repo-root/
 ├── dags/
 │   └── threat_analysis_dag.py
@@ -12,6 +13,7 @@ repo-root/
     └── security_logic/
         ├── __init__.py
         └── mappings.py     # CATEGORY_TO_CLASSTYPE , CLASSTYPE_SCORE_RANGE 등 위치
+```
 
 | DAG | 스케줄 | 역할 |
 |---|---|---|
