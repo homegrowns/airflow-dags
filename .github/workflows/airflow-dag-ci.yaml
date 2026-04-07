@@ -36,7 +36,7 @@ jobs:
         run: |
           # Airflow DB 없이 DAG가 파싱 가능한지 확인하는 테스트
           export AIRFLOW__CORE__LOAD_EXAMPLES=False
-          pytest tests/test_dag_integrity.py
+          pytest test/test_dag_integrity.py
 
       - name: Security Scan (Gitleaks)
         uses: gitleaks/gitleaks-action@v2
