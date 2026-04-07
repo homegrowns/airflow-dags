@@ -12,7 +12,7 @@ repo-root/
 │   └── dag_neo4j_to_rag.py
 └── plugins/                # git-sync가 이 폴더도 동기화하도록 설정
     ├── __init__.py
-    └── security_logic/
+    └── security_metadata/
         ├── __init__.py
         └── mappings.py     # CATEGORY_TO_CLASSTYPE , CLASSTYPE_SCORE_RANGE 등 위치
 ```
