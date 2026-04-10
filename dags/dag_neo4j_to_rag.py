@@ -56,8 +56,8 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-import threading
-from concurrent.futures import ThreadPoolExecutor, Future
+# import threading
+# from concurrent.futures import ThreadPoolExecutor, Future
 
 import boto3
 from airflow import DAG
@@ -133,7 +133,7 @@ GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"
 # TODO: 디폴트값 넣고 나중에 airlfow variable로 변경 가능하게
 CHUNK_SIZE = 300  # 청크당 세션 수 (= 파드당 처리량)
 MAX_MAP_SIZE = 32  # Airflow Dynamic Task 최대 수 (안전 상한)
-
+SUSPICION_THRESHOLD = 30
 # ══════════════════════════════════════════════════════════════════════════════
 # Task 0 : resolve_session_gold_prefix
 # ══════════════════════════════════════════════════════════════════════════════
@@ -336,17 +336,17 @@ def filter_whitelist(**ctx) -> None:
     )
     raw_sessions: list[dict] = s3_read_json(raw_sessions_key)
 
-    repeat_map = _build_repeat_count_map(raw_sessions)
+    repeat_map = build_repeat_count_map(raw_sessions)
     passed: list[dict] = []
     filtered: dict[str, int] = {"whitelist_ip": 0, "low_score": 0}
 
     for sess in raw_sessions:
-        if _is_whitelisted_session(sess):
+        if is_whitelisted_session(sess):
             filtered["whitelist_ip"] += 1
             continue
         cid = str(sess.get("community_id") or id(sess))
         repeat_count = repeat_map.get(cid, 1)
-        score = _calc_suspicion_score(sess, repeat_count=repeat_count)
+        score = calc_suspicion_score(sess, repeat_count=repeat_count)
         if score < SUSPICION_THRESHOLD:
             filtered["low_score"] += 1
             continue
@@ -534,7 +534,7 @@ def run_rag_chunk(chunk_info: dict) -> dict:
 
     # 청크 결과를 별도 S3 키에 저장 (merge 단계에서 합침)
     safe_key = chunk_key.replace(".json", "_result.jsonl")
-    writer = _S3StreamingWriter(safe_key)
+    writer = S3StreamingWriter(safe_key)
     writer.start()
 
     groq = groq_client()
@@ -548,7 +548,7 @@ def run_rag_chunk(chunk_info: dict) -> dict:
 
     for i, sg in enumerate(subgraphs):
         session_id = sg["session"].get("session_id", f"c{chunk_idx}_u{i}")
-        user_text = _subgraph_to_text(sg)
+        user_text = subgraph_to_text(sg)
         current_model = GROQ_FALLBACK_MODEL if use_fallback else model
 
         def _call(mdl: str):
@@ -566,7 +566,7 @@ def run_rag_chunk(chunk_info: dict) -> dict:
             nonlocal error_count
             raw = response.choices[0].message.content.strip()
             suspicion_score = sg["session"].get("suspicion_score", 0)
-            analysis = _parse_response(raw, suspicion_score)
+            analysis = parse_response(raw, suspicion_score)
             writer.put(
                 {
                     "session_id": session_id,

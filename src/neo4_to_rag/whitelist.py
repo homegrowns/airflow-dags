@@ -16,7 +16,6 @@ WHITELIST_IPS: set[str] = {
     "192.168.0.10",
 }
 WHITELIST_CIDRS: list[str] = ["10.0.2.0/24"]
-SUSPICION_THRESHOLD = 30
 REPEAT_WINDOW_SEC = 10
 
 
