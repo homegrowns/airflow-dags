@@ -19,6 +19,7 @@ repo-root/
     │   └── mappings.py     CATEGORY_TO_CLASSTYPE , CLASSTYPE_SCORE_RANGE 등 위치
     ├── common/   
     │   ├── common_helper.py
+    │   └── query_v1.py
     │  
     ├── gold_to_neo4j/
     │   
