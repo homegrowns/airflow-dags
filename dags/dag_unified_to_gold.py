@@ -63,7 +63,7 @@ from security_metadata.aws_config import (
     BATCH_SIZE,
 )
 
-from src.unified__to_gold.gold_parquet_route import (
+from src.unified_to_gold.gold_parquet_route import (
     gold_s3_key,
     silver_sensor_prefix,
     next_silver_prefix,
