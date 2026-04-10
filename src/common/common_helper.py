@@ -169,26 +169,26 @@ def now_kst_iso() -> str:
     return datetime.now(tz=KST).isoformat()
 
 
-def ms_to_kst_iso(ms: Any) -> str | None:
-    if ms is None:
-        return None
-    if isinstance(ms, str):
-        try:
-            s = ms.replace(" ", "T")
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            dt = datetime.fromisoformat(s)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(KST).isoformat()
-        except Exception:
-            return ms
-    try:
-        return (
-            datetime.fromtimestamp(int(ms) / 1000.0, tz=timezone.utc)
-            .astimezone(KST)
-            .isoformat()
-        )
-    except Exception:
-        return str(ms)
+# def ms_to_kst_iso(ms: Any) -> str | None:
+#     if ms is None:
+#         return None
+#     if isinstance(ms, str):
+#         try:
+#             s = ms.replace(" ", "T")
+#             if s.endswith("Z"):
+#                 s = s[:-1] + "+00:00"
+#             dt = datetime.fromisoformat(s)
+#             if dt.tzinfo is None:
+#                 dt = dt.replace(tzinfo=timezone.utc)
+#             return dt.astimezone(KST).isoformat()
+#         except Exception:
+#             return ms
+#     try:
+#         return (
+#             datetime.fromtimestamp(int(ms) / 1000.0, tz=timezone.utc)
+#             .astimezone(KST)
+#             .isoformat()
+#         )
+#     except Exception:
+#         return str(ms)
 

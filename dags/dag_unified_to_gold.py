@@ -8,7 +8,7 @@ S3 silver/common_records (Spark 파티션 parquet) → session_gold / entity_gol
     · 다음 minute_10 폴더가 생기면 현재 폴더 완성으로 판단
     · 예) minute_10=10 처리 중 → minute_10=20 폴더 감지되면 통과
   - _silver_sensor_prefix / _gold_s3_key: KST 변환 적용
-  - _ms_to_iso → msto_kst_iso (KST 변환)
+  - _ms_to_iso → ms_to_kst_iso (KST 변환)
   - _load_silver_records fallback 제거 (wait_for_silver 통과 후 없으면 에러)
   - TriggerDagRunOperator: neo4j_to_rag 트리거 (session_key conf 전달)
 
@@ -206,8 +206,8 @@ def _load_silver_records(ctx) -> list[dict]:
 
     for _, row in df.iterrows():
         record: dict[str, Any] = {k: _convert(v) for k, v in row.to_dict().items()}
-        record["flow_start"] = msto_kst_iso(record.get("flow_start"))
-        record["flow_end"] = msto_kst_iso(record.get("flow_end"))
+        record["flow_start"] = ms_to_kst_iso(record.get("flow_start"))
+        record["flow_end"] = ms_to_kst_iso(record.get("flow_end"))
 
         tl_raw = record.get("timeline", [])
         if isinstance(tl_raw, str):
