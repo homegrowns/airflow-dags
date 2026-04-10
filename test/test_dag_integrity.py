@@ -1,14 +1,10 @@
 import pytest
 from airflow.models import DagBag
-from src.common.common_helper import *
-from security_metadata.aws_config import *
-from security_metadata.mappings import *
-from src.gold_to_neo4j.neo4j.session_query_v1 import *
-from src.neo4_to_rag.s3_route_helper import *
-from src.neo4_to_rag.s3_tmp_helper import *
-from src.neo4_to_rag.s3_streaming_writer import *
-from src.neo4_to_rag.neo4j.prompt import *
-from src.unified_to_gold.gold_parquet_route import *
+from security_metadata import *
+from src.common import *
+from src.gold_to_neo4j import *
+from src.neo4_to_rag import *
+from src.unified_to_gold import *
 
 def test_dag_bag():
     # DAG 폴더 내의 모든 파일을 로드하여 임포트 에러가 발생하는지 체크
