@@ -64,7 +64,7 @@ from airflow import DAG
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator
 from airflow.decorators import task
-from plugins.security_metadata.mappings import (
+from security_metadata.mappings import (
     CATEGORY_TO_CLASSTYPE,
     CLASSTYPE_SCORE_RANGE,
     CLASSTYPE_RANK,
