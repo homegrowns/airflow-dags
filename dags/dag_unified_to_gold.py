@@ -8,7 +8,7 @@ S3 silver/common_records (Spark 파티션 parquet) → session_gold / entity_gol
     · 다음 minute_10 폴더가 생기면 현재 폴더 완성으로 판단
     · 예) minute_10=10 처리 중 → minute_10=20 폴더 감지되면 통과
   - _silver_sensor_prefix / _gold_s3_key: KST 변환 적용
-  - _ms_to_iso → _ms_to_kst_iso (KST 변환)
+  - _ms_to_iso → msto_kst_iso (KST 변환)
   - _load_silver_records fallback 제거 (wait_for_silver 통과 후 없으면 에러)
   - TriggerDagRunOperator: neo4j_to_rag 트리거 (session_key conf 전달)
 
@@ -40,118 +40,44 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-import boto3
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.sensors.python import PythonSensor
 from airflow.sdk import Asset
 
+from src.common.common_helper import (
+    s3_client,
+    to_kst,
+    msto_kst_iso,
+)
+
+from security_metadata.aws_config import (
+    S3_BUCKET,
+    AWS_REGION,
+    S3_SILVER_PREFIX,
+    S3_GOLD_PREFIX,
+    GOLD_SESSION_ASSET,
+    GOLD_ENTITY_ASSET,
+    GOLD_RELATION_ASSET,
+    BATCH_SIZE,
+)
+
+from src.unified__to_gold.gold_parquet_route import (
+    gold_s3_key,
+    silver_sensor_prefix,
+    next_silver_prefix,
+)
+
 # ── S3 설정 ───────────────────────────────────────────────────────────────────
-S3_BUCKET = "malware-project-bucket"
-S3_SILVER_PREFIX = "silver/common_records/"
-S3_GOLD_PREFIX = "gold"
-AWS_REGION = "ap-northeast-2"
 
 KST = ZoneInfo("Asia/Seoul")
 
-GOLD_SESSION_ASSET = Asset("s3://malware-project-bucket/gold/session_gold")
-GOLD_ENTITY_ASSET = Asset("s3://malware-project-bucket/gold/entity_gold")
-GOLD_RELATION_ASSET = Asset("s3://malware-project-bucket/gold/relation_gold")
+GOLD_SESSION_ASSET = Asset(GOLD_SESSION_ASSET)
+GOLD_ENTITY_ASSET = Asset(GOLD_ENTITY_ASSET)
+GOLD_RELATION_ASSET = Asset(GOLD_RELATION_ASSET)
 
 logger = logging.getLogger(__name__)
-
-
-# ── 공통 S3 헬퍼 ──────────────────────────────────────────────────────────────
-
-
-def _s3_client():
-    return boto3.client("s3", region_name=AWS_REGION)
-
-
-# ── KST 변환 헬퍼 ─────────────────────────────────────────────────────────────
-
-
-def _to_kst(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(KST)
-
-
-def _ms_to_kst_iso(ms: Any) -> str | None:
-    """Unix ms (int) 또는 ISO 문자열 → KST ISO 문자열."""
-    if ms is None:
-        return None
-    if isinstance(ms, str):
-        try:
-            s = ms.replace(" ", "T")
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            dt = datetime.fromisoformat(s)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(KST).isoformat()
-        except Exception:
-            return ms
-    try:
-        return (
-            datetime.fromtimestamp(int(ms) / 1000.0, tz=timezone.utc)
-            .astimezone(KST)
-            .isoformat()
-        )
-    except (ValueError, TypeError, OSError):
-        return str(ms)
-
-
-# ── gold parquet 경로 생성 ────────────────────────────────────────────────────
-
-
-def _gold_s3_key(table: str, execution_date: datetime) -> str:
-    """
-    KST 기준 gold parquet 경로.
-    예) gold/session_gold/dt=2026-03-29/hour=01/minute_10=50/minute_10=50_session_gold.parquet
-    """
-    kst = _to_kst(execution_date)
-    dt = kst.strftime("%Y-%m-%d")
-    hour = kst.strftime("%H")
-    minute_10 = f"{(kst.minute // 10) * 10:02d}"
-    return (
-        f"{S3_GOLD_PREFIX}/{table}"
-        f"/dt={dt}/hour={hour}/minute_10={minute_10}"
-        f"/minute_10={minute_10}_{table}.parquet"
-    )
-
-
-def _silver_sensor_prefix(execution_date: datetime) -> str:
-    # # ── 임시 테스트용 override ─────────────────────────────
-    # TEST_PREFIX = "silver/common_records/dt=2026-03-29/hour=03/minute_10=50/"
-    # logger.warning("_silver_sensor_prefix: TEST_PREFIX override — %s", TEST_PREFIX)
-    # return TEST_PREFIX
-    # ── 테스트 끝나면 제거 ────────────────────────────────
-    """KST 기준 silver prefix."""
-    kst = _to_kst(execution_date)
-    dt = kst.strftime("%Y-%m-%d")
-    hour = kst.strftime("%H")
-    minute_10 = f"{(kst.minute // 10) * 10:02d}"
-    return f"{S3_SILVER_PREFIX}dt={dt}/hour={hour}/minute_10={minute_10}/"
-
-
-def _next_silver_prefix(execution_date: datetime) -> str:
-    # ── 임시: 이미 존재하는 경로로 고정 ──────────────────
-    # return "silver/common_records/dt=2026-03-29/hour=04/minute_10=00/"
-    # """현재 배치의 다음 minute_10 silver prefix (KST 기준)."""
-    kst = _to_kst(execution_date)
-    next_minute = ((kst.minute // 10) + 1) * 10
-
-    if next_minute >= 60:
-        next_kst = kst.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-        next_minute = 0
-    else:
-        next_kst = kst
-
-    dt = next_kst.strftime("%Y-%m-%d")
-    hour = next_kst.strftime("%H")
-    return f"{S3_SILVER_PREFIX}dt={dt}/hour={hour}/minute_10={next_minute:02d}/"
 
 
 # ── parquet 읽기/쓰기 ─────────────────────────────────────────────────────────
@@ -164,7 +90,7 @@ def _s3_write_parquet(s3_key: str, records: list[dict]) -> None:
     buf = io.BytesIO()
     df.to_parquet(buf, index=False)
     buf.seek(0)
-    s3 = _s3_client()
+    s3 = s3_client()
     s3.put_object(
         Bucket=S3_BUCKET,
         Key=s3_key,
@@ -191,7 +117,7 @@ def _s3_write_parquet(s3_key: str, records: list[dict]) -> None:
 def _s3_read_parquet(s3_key: str) -> list[dict]:
     import pandas as pd
 
-    obj = _s3_client().get_object(Bucket=S3_BUCKET, Key=s3_key)
+    obj = s3_client().get_object(Bucket=S3_BUCKET, Key=s3_key)
     df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
     return df.where(df.notna(), None).to_dict(orient="records")
 
@@ -200,7 +126,7 @@ def _s3_read_parquet(s3_key: str) -> list[dict]:
 
 
 def _list_silver_parquet_keys(prefix: str) -> list[str]:
-    s3 = _s3_client()
+    s3 = s3_client()
     paginator = s3.get_paginator("list_objects_v2")
     keys: list[str] = []
     for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
@@ -229,7 +155,7 @@ def _load_silver_records(ctx) -> list[dict]:
         # wait_for_silver 통과 후 여기 오면 안 됨
         raise ValueError(f"silver parquet 없음 — prefix: {prefix}")
 
-    s3 = _s3_client()
+    s3 = s3_client()
     frames: list = []
     for key in keys:
         try:
@@ -280,8 +206,8 @@ def _load_silver_records(ctx) -> list[dict]:
 
     for _, row in df.iterrows():
         record: dict[str, Any] = {k: _convert(v) for k, v in row.to_dict().items()}
-        record["flow_start"] = _ms_to_kst_iso(record.get("flow_start"))
-        record["flow_end"] = _ms_to_kst_iso(record.get("flow_end"))
+        record["flow_start"] = msto_kst_iso(record.get("flow_start"))
+        record["flow_end"] = msto_kst_iso(record.get("flow_end"))
 
         tl_raw = record.get("timeline", [])
         if isinstance(tl_raw, str):
@@ -642,6 +568,7 @@ def extract_sessions(**ctx) -> None:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Task 3 : extract_entities
+# TODO 데이터 전처리 panda or Polars 고려
 # ══════════════════════════════════════════════════════════════════════════════
 
 
