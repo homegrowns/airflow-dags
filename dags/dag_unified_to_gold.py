@@ -49,7 +49,7 @@ from airflow.sdk import Asset
 from src.common.common_helper import (
     s3_client,
     to_kst,
-    msto_kst_iso,
+    ms_to_kst_iso,
 )
 
 from security_metadata.aws_config import (
