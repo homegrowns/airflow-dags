@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 from airflow.models import Variable
 
-from security_metadata.aws_config import (
+from src.security_metadata.aws_config import (
     S3_BUCKET,
     AWS_REGION,
     BATCH_SIZE,

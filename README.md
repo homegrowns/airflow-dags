@@ -21,10 +21,7 @@ repo-root/
     │   ├── common_helper.py
     │  
     ├── gold_to_neo4j/
-    │   ├── __init__.py
-    │   └── neo4j/
-    │       ├── __init__.py
-    │       └── session_query_v2.py
+    │   
     ├── neo4_to_rag/
     │   ├── __init__.py
     │   ├── s3_route_helper.py

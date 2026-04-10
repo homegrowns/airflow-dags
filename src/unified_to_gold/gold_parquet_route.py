@@ -1,6 +1,6 @@
 from datetime import datetime, timezone, timedelta
 
-from security_metadata.aws_config import (
+from src.security_metadata.aws_config import (
     S3_SILVER_PREFIX,
     S3_GOLD_PREFIX,
 )

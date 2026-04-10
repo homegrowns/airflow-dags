@@ -1,7 +1,7 @@
 import json
 from typing import Any
 from src.common.common_helper import s3_client
-from security_metadata.aws_config import (
+from src.security_metadata.aws_config import (
     S3_BUCKET,
     S3_TMP_PREFIX,
 )

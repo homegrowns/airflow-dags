@@ -1,7 +1,7 @@
 import threading
 
 from src.common.common_helper import s3_client
-from security_metadata.aws_config import (
+from src.security_metadata.aws_config import (
     S3_BUCKET,
 )
 
