@@ -51,7 +51,7 @@ from src.common.query_v1 import (
     INDEXES,
 )
 
-from security_metadata.aws_config import (
+from src.security_metadata.aws_config import (
     S3_BUCKET,
     AWS_REGION,
     S3_SESSION_GOLD_PREFIX,

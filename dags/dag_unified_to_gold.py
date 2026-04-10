@@ -52,7 +52,7 @@ from src.common.common_helper import (
     ms_to_kst_iso,
 )
 
-from security_metadata.aws_config import (
+from src.security_metadata.aws_config import (
     S3_BUCKET,
     AWS_REGION,
     S3_SILVER_PREFIX,

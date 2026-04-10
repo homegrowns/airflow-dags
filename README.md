@@ -10,12 +10,11 @@ repo-root/
 │   ├── dag_unified_events_to_gold.py
 │   ├── dag_gold_to_neo4j.py
 │   └── dag_neo4j_to_rag.py
-├── plugins/                # git-sync가 이 폴더도 동기화하도록 설정
+├── plugins/                
+├── security_metadata/
 │   ├── __init__.py
-│   └── security_metadata/
-│       ├── __init__.py
-│       ├── aws_config.py
-│       └── mappings.py     # CATEGORY_TO_CLASSTYPE , CLASSTYPE_SCORE_RANGE 등 위치
+│   ├── aws_config.py   aws 설정
+│   └── mappings.py     CATEGORY_TO_CLASSTYPE , CLASSTYPE_SCORE_RANGE 등 위치
 └── src/                
     ├── __init__.py
     ├── common/   

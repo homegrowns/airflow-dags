@@ -64,13 +64,13 @@ from airflow import DAG
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator
 from airflow.decorators import task
-from security_metadata.mappings import (
+from src.security_metadata.mappings import (
     CATEGORY_TO_CLASSTYPE,
     CLASSTYPE_SCORE_RANGE,
     CLASSTYPE_RANK,
 )
 
-from security_metadata.aws_config import (
+from src.security_metadata.aws_config import (
     S3_BUCKET,
     S3_SESSION_GOLD_PREFIX,
     S3_RAG_PREFIX,
