@@ -1,6 +1,6 @@
 import pytest
 from airflow.models import DagBag
-from security_metadata import *
+from src.security_metadata import *
 from src.common import *
 from src.gold_to_neo4j import *
 from src.neo4_to_rag import *

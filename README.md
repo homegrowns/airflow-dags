@@ -11,12 +11,12 @@ repo-root/
 │   ├── dag_gold_to_neo4j.py
 │   └── dag_neo4j_to_rag.py
 ├── plugins/                
-├── security_metadata/
-│   ├── __init__.py
-│   ├── aws_config.py   aws 설정
-│   └── mappings.py     CATEGORY_TO_CLASSTYPE , CLASSTYPE_SCORE_RANGE 등 위치
 └── src/                
     ├── __init__.py
+    ├── security_metadata/
+    │   ├── __init__.py
+    │   ├── aws_config.py   aws 설정
+    │   └── mappings.py     CATEGORY_TO_CLASSTYPE , CLASSTYPE_SCORE_RANGE 등 위치
     ├── common/   
     │   ├── common_helper.py
     │  
@@ -32,9 +32,8 @@ repo-root/
     │   ├── s3_tmp_helper.py
     │   └── prompt.py
     └── unified_to_gold/
-    │   ├── __init__.py
-    │   │
-    │   └── gold_parquet_route.py
+        ├── __init__.py
+        └── gold_parquet_route.py
 
 ```
 
