@@ -1,6 +1,6 @@
 import re
 
-from src.common_helper import s3_client
+from src.common.common_helper import s3_client
 from security_metadata.aws_config import (
     S3_BUCKET,
     S3_SESSION_GOLD_PREFIX,
