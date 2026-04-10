@@ -148,7 +148,7 @@ def _load_silver_records(ctx) -> list[dict]:
     import pandas as pd
 
     execution_date: datetime = ctx["logical_date"]
-    prefix = _silver_sensor_prefix(execution_date)
+    prefix = silver_sensor_prefix(execution_date)
     keys = _list_silver_parquet_keys(prefix)
 
     if not keys:
@@ -282,7 +282,7 @@ def _check_next_partition_exists(**ctx) -> bool:
     예) 현재=minute_10=10 → minute_10=20 폴더에 파일 있으면 통과.
     """
     execution_date: datetime = ctx["logical_date"]
-    next_prefix = _next_silver_prefix(execution_date)
+    next_prefix = next_silver_prefix(execution_date)
     keys = _list_silver_parquet_keys(next_prefix)
 
     if keys:
@@ -294,7 +294,7 @@ def _check_next_partition_exists(**ctx) -> bool:
         )
         return True
 
-    current_prefix = _silver_sensor_prefix(execution_date)
+    current_prefix = silver_sensor_prefix(execution_date)
     logger.info(
         "wait_for_silver: 대기 중\n" "  current: %s\n" "  waiting: %s",
         current_prefix,
@@ -559,7 +559,7 @@ def extract_sessions(**ctx) -> None:
             }
         )
 
-    session_key = _gold_s3_key("session_gold", execution_date)
+    session_key = gold_s3_key("session_gold", execution_date)
     _s3_write_parquet(session_key, records)
     logger.info("extract_sessions 완료 — %d 세션 → %s", len(records), session_key)
     ctx["ti"].xcom_push(key="session_key", value=session_key)
@@ -743,7 +743,7 @@ def extract_entities(**ctx) -> None:
             }
         )
 
-    entity_key = _gold_s3_key("entity_gold", execution_date)
+    entity_key = gold_s3_key("entity_gold", execution_date)
     _s3_write_parquet(entity_key, records)
     logger.info(
         "extract_entities 완료 — ip:%d domain:%d alert:%d → %s",
@@ -873,7 +873,7 @@ def extract_relations(**ctx) -> None:
                     sid,
                 )
 
-    relation_key = _gold_s3_key("relation_gold", execution_date)
+    relation_key = gold_s3_key("relation_gold", execution_date)
     _s3_write_parquet(relation_key, records)
     logger.info("extract_relations 완료 — %d 관계 → %s", len(records), relation_key)
     ctx["ti"].xcom_push(key="relation_key", value=relation_key)

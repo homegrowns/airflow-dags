@@ -58,12 +58,12 @@ from security_metadata.aws_config import (
     GOLD_SESSION_ASSET,
     GOLD_ENTITY_ASSET,
     GOLD_RELATION_ASSET,
-    BATCH_SIZE,
 )
 
 from src.common.common_helper import (
     s3_client,
     neo4j_driver,
+    s3_read_parquet,
     run_batches,
     sibling_key,
     prefix_from_key,
@@ -123,7 +123,7 @@ def load_sessions(**ctx) -> None:
         )
     logger.info("load_sessions: session_key = %s", session_key)
 
-    records = _s3_read_parquet(session_key)
+    records = s3_read_parquet(session_key)
     for r in records:
         r["flow_start"] = to_kst_iso(r.get("flow_start"))
         r["flow_end"] = to_kst_iso(r.get("flow_end"))
@@ -147,7 +147,7 @@ def load_entities(**ctx) -> None:
     entity_key = sibling_key(session_key, "entity_gold")
     logger.info("load_entities: entity_key = %s", entity_key)
 
-    records = _s3_read_parquet(entity_key)
+    records = s3_read_parquet(entity_key)
     buckets: dict[str, list[dict]] = defaultdict(list)
     for r in records:
         buckets[r["entity_type"]].append(r)
@@ -156,9 +156,9 @@ def load_entities(**ctx) -> None:
     counts: dict[str, int] = {}
     with driver.session() as neo_sess:
         for etype, query in [
-            ("ip", _IP_QUERY),
-            ("domain", _DOMAIN_QUERY),
-            ("alert", _ALERT_QUERY),
+            ("ip", IP_QUERY),
+            ("domain", DOMAIN_QUERY),
+            ("alert", ALERT_QUERY),
         ]:
             rows = buckets.get(etype, [])
             if rows:
@@ -177,8 +177,8 @@ def load_relations(**ctx) -> None:
     relation_key = sibling_key(session_key, "relation_gold")
     logger.info("load_relations: relation_key = %s", relation_key)
 
-    raw_relations = _s3_read_parquet(relation_key)
-    sessions = _s3_read_parquet(session_key)
+    raw_relations = s3_read_parquet(relation_key)
+    sessions = s3_read_parquet(session_key)
 
     driver = neo4j_driver()
     with driver.session() as neo_sess:
@@ -194,10 +194,10 @@ def load_relations(**ctx) -> None:
         ]
 
         if sess_dst:
-            cnt = run_batches(neo_sess, _SESSION_CONN_QUERY, sess_dst)
+            cnt = run_batches(neo_sess, SESSION_CONN_QUERY, sess_dst)
             logger.info("load_relations: Session-[:CONNECTED_TO]→IP  %d", cnt)
         if sess_src:
-            cnt = run_batches(neo_sess, _SESSION_ORIG_QUERY, sess_src)
+            cnt = run_batches(neo_sess, SESSION_ORIG_QUERY, sess_src)
             logger.info("load_relations: Session-[:ORIGINATED_FROM]→IP  %d", cnt)
 
         buckets: dict[str, list[dict]] = defaultdict(list)
@@ -211,7 +211,7 @@ def load_relations(**ctx) -> None:
 
         counts: dict[str, int] = {}
         for key, rows in buckets.items():
-            query = _RELATION_QUERIES.get(key)
+            query = RELATION_QUERIES.get(key)
             if not query:
                 logger.warning("알 수 없는 relation 키: %s — 스킵", key)
                 continue
@@ -227,7 +227,7 @@ def load_relations(**ctx) -> None:
 def create_indexes(**ctx) -> None:
     driver = neo4j_driver()
     with driver.session() as neo_sess:
-        for cypher in _CONSTRAINTS + _INDEXES:
+        for cypher in CONSTRAINTS + INDEXES:
             neo_sess.run(cypher)
             logger.info("인덱스/제약 적용: %s", cypher[:80])
     driver.close()

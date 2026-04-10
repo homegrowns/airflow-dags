@@ -403,7 +403,7 @@ def resolve_session_gold_prefix(**ctx) -> None:
         logger.warning(
             "resolve_session_gold_prefix: conf 없음 — S3 최신 _SUCCESS fallback"
         )
-        s3 = _s3_client()
+        s3 = s3_client()
         paginator = s3.get_paginator("list_objects_v2")
 
         success_keys: list[tuple[datetime, str]] = []
@@ -420,7 +420,7 @@ def resolve_session_gold_prefix(**ctx) -> None:
         prefix = latest_success.rsplit("/", 1)[0] + "/"
         logger.info("resolve_session_gold_prefix: 최신 _SUCCESS → prefix = %s", prefix)
 
-    partition = _parse_gold_partition(prefix)
+    partition = parse_gold_partition(prefix)
     logger.info("resolve_session_gold_prefix: partition = %s", partition)
 
     ctx["ti"].xcom_push(key="session_gold_prefix", value=prefix)
@@ -448,16 +448,16 @@ def load_session_gold(**ctx) -> None:
     partition = ctx["ti"].xcom_pull(
         task_ids="resolve_session_gold_prefix",
         key="gold_partition",
-    ) or _parse_gold_partition(prefix)
+    ) or parse_gold_partition(prefix)
 
     ctx["ti"].xcom_push(key="gold_partition", value=partition)
     logger.info("load_session_gold: prefix = %s, partition = %s", prefix, partition)
 
-    keys = _list_session_gold_keys(prefix)
+    keys = list_session_gold_keys(prefix)
     if not keys:
         raise ValueError(f"session_gold parquet 파일 없음 — prefix: {prefix}")
 
-    s3 = _s3_client()
+    s3 = s3_client()
     frames: list[Any] = []
     for key in keys:
         try:
@@ -504,7 +504,7 @@ def load_session_gold(**ctx) -> None:
         # 각 이벤트의 ts 필드 KST 변환 (파싱과 동일 순회에서 처리)
         for ev in parsed:
             if isinstance(ev, dict) and ev.get("ts") is not None:
-                ev["ts"] = _ms_to_kst_iso(ev["ts"])
+                ev["ts"] = ms_to_kst_iso(ev["ts"])
         return parsed
 
     if "timeline" in df.columns:
@@ -564,8 +564,8 @@ def load_session_gold(**ctx) -> None:
     raw_sessions = list(merged.values())
     logger.info("load_session_gold 완료 — %d 세션", len(raw_sessions))
 
-    tmp_key = _s3_tmp_key(run_id, "raw_sessions")
-    _s3_write_json(tmp_key, raw_sessions)
+    tmp_key = s3_tmp_key(run_id, "raw_sessions")
+    s3_write_json(tmp_key, raw_sessions)
 
     ctx["ti"].xcom_push(key="raw_sessions_s3_key", value=tmp_key)
     ctx["ti"].xcom_push(key="total_loaded", value=len(raw_sessions))
@@ -582,7 +582,7 @@ def filter_whitelist(**ctx) -> None:
     raw_sessions_key = ctx["ti"].xcom_pull(
         task_ids="load_session_gold", key="raw_sessions_s3_key"
     )
-    raw_sessions: list[dict] = _s3_read_json(raw_sessions_key)
+    raw_sessions: list[dict] = s3_read_json(raw_sessions_key)
 
     repeat_map = _build_repeat_count_map(raw_sessions)
     passed: list[dict] = []
@@ -609,9 +609,9 @@ def filter_whitelist(**ctx) -> None:
         filtered["low_score"],
     )
 
-    tmp_key = _s3_tmp_key(run_id, "filtered_sessions")
-    _s3_write_json(tmp_key, passed)
-    _s3_delete(raw_sessions_key)
+    tmp_key = s3_tmp_key(run_id, "filtered_sessions")
+    s3_write_json(tmp_key, passed)
+    s3_delete(raw_sessions_key)
 
     ctx["ti"].xcom_push(key="filtered_sessions_s3_key", value=tmp_key)
     ctx["ti"].xcom_push(key="filter_stats", value=filtered)
@@ -628,18 +628,18 @@ def build_subgraphs(**ctx) -> None:
     filtered_key = ctx["ti"].xcom_pull(
         task_ids="filter_whitelist", key="filtered_sessions_s3_key"
     )
-    sessions: list[dict] = _s3_read_json(filtered_key)
+    sessions: list[dict] = s3_read_json(filtered_key)
 
     if not sessions:
         logger.warning("build_subgraphs: 처리할 세션 없음")
-        tmp_key = _s3_tmp_key(run_id, "subgraphs")
-        _s3_write_json(tmp_key, [])
+        tmp_key = s3_tmp_key(run_id, "subgraphs")
+        s3_write_json(tmp_key, [])
         ctx["ti"].xcom_push(key="subgraphs_s3_key", value=tmp_key)
         return
 
     for idx, sess in enumerate(sessions):
         if not sess.get("session_id"):
-            sess["session_id"] = _make_session_id(sess.get("community_id"), idx)
+            sess["session_id"] = make_session_id(sess.get("community_id"), idx)
 
     sess_index = {s["session_id"]: s for s in sessions}
     session_ids = list(sess_index.keys())
@@ -663,7 +663,7 @@ def build_subgraphs(**ctx) -> None:
     """
 
     total_edges = 0
-    driver = _neo4j_driver()
+    driver = neo4j_driver()
     with driver.session() as neo_sess:
         for i in range(0, len(session_ids), NEO4J_BATCH_SIZE):
             batch = session_ids[i : i + NEO4J_BATCH_SIZE]
@@ -704,9 +704,9 @@ def build_subgraphs(**ctx) -> None:
         len(subgraphs) - neo4j_hit,
     )
 
-    tmp_key = _s3_tmp_key(run_id, "subgraphs")
-    _s3_write_json(tmp_key, subgraphs)
-    _s3_delete(filtered_key)
+    tmp_key = s3_tmp_key(run_id, "subgraphs")
+    s3_write_json(tmp_key, subgraphs)
+    s3_delete(filtered_key)
 
     ctx["ti"].xcom_push(key="subgraphs_s3_key", value=tmp_key)
 
@@ -729,7 +729,7 @@ def split_subgraphs(**ctx) -> list[dict]:
     subgraphs_key = ctx["ti"].xcom_pull(
         task_ids="build_subgraphs", key="subgraphs_s3_key"
     )
-    subgraphs: list[dict] = _s3_read_json(subgraphs_key)
+    subgraphs: list[dict] = s3_read_json(subgraphs_key)
 
     partition: dict = (
         ctx["ti"].xcom_pull(task_ids="load_session_gold", key="gold_partition") or {}
@@ -737,9 +737,9 @@ def split_subgraphs(**ctx) -> list[dict]:
 
     if not subgraphs:
         logger.warning("split_subgraphs: 처리할 서브그래프 없음 — 빈 청크 1개 생성")
-        empty_key = _s3_tmp_key(run_id, "chunk_0")
-        _s3_write_json(empty_key, [])
-        _s3_delete(subgraphs_key)
+        empty_key = s3_tmp_key(run_id, "chunk_0")
+        s3_write_json(empty_key, [])
+        s3_delete(subgraphs_key)
         return [{"chunk_key": empty_key, "chunk_idx": 0, "partition": partition}]
 
     # 300개씩 분할
@@ -760,8 +760,8 @@ def split_subgraphs(**ctx) -> list[dict]:
 
     chunk_infos: list[dict] = []
     for idx, chunk in enumerate(chunks):
-        chunk_key = _s3_tmp_key(run_id, f"chunk_{idx}")
-        _s3_write_json(chunk_key, chunk)
+        chunk_key = s3_tmp_key(run_id, f"chunk_{idx}")
+        s3_write_json(chunk_key, chunk)
         chunk_infos.append(
             {
                 "chunk_key": chunk_key,
@@ -771,7 +771,7 @@ def split_subgraphs(**ctx) -> list[dict]:
         )
         logger.info("split_subgraphs: 청크[%d] %d개 → %s", idx, len(chunk), chunk_key)
 
-    _s3_delete(subgraphs_key)
+    s3_delete(subgraphs_key)
     logger.info("split_subgraphs: 총 %d개 → %d 청크", len(subgraphs), len(chunks))
     return chunk_infos
 
@@ -794,17 +794,17 @@ def run_rag_chunk(chunk_info: dict) -> dict:
     chunk_idx = chunk_info["chunk_idx"]
     partition = chunk_info["partition"]
 
-    subgraphs: list[dict] = _s3_read_json(chunk_key)
+    subgraphs: list[dict] = s3_read_json(chunk_key)
 
     # 청크 결과를 별도 S3 키에 저장 (merge 단계에서 합침)
     safe_key = chunk_key.replace(".json", "_result.jsonl")
     writer = _S3StreamingWriter(safe_key)
     writer.start()
 
-    groq = _groq_client()
-    model = _groq_model()
+    groq = groq_client()
+    model = groq_model()
     use_fallback = False
-    inference_dt = _now_kst_iso()
+    inference_dt = now_kst_iso()
     error_count = 0
     threat_dist: dict[str, int] = {}
 
@@ -906,7 +906,7 @@ def run_rag_chunk(chunk_info: dict) -> dict:
         time.sleep(GROQ_RPM_SLEEP)
 
     saved_count, write_errors = writer.finish()
-    _s3_delete(chunk_key)  # 처리 완료된 청크 tmp 삭제
+    s3_delete(chunk_key)  # 처리 완료된 청크 tmp 삭제
 
     logger.info(
         "run_rag_chunk[%d]: 완료 — 저장 %d건 | 오류 %d건",
@@ -941,8 +941,8 @@ def merge_rag_results(chunk_results: list[dict], **ctx) -> None:
 
     # partition은 모든 청크가 동일 → 첫 번째에서 가져옴
     partition = chunk_results[0].get("partition", {})
-    final_key = _build_rag_s3_key(partition)
-    s3 = _s3_client()
+    final_key = build_rag_s3_key(partition)
+    s3 = s3_client()
 
     all_lines: list[str] = []
     total_saved = 0
@@ -973,7 +973,7 @@ def merge_rag_results(chunk_results: list[dict], **ctx) -> None:
             threat_dist[tt] = threat_dist.get(tt, 0) + cnt
 
         # 청크 결과 파일 삭제
-        _s3_delete(result_key)
+        s3_delete(result_key)
 
     # 최종 JSONL 업로드
     if all_lines:
@@ -994,7 +994,7 @@ def merge_rag_results(chunk_results: list[dict], **ctx) -> None:
     # 통계 XCom 저장
     ctx["ti"].xcom_push(key="saved_s3_key", value=final_key)
     ctx["ti"].xcom_push(key="saved_count", value=total_saved)
-    ctx["ti"].xcom_push(key="inference_datetime", value=_now_kst_iso())
+    ctx["ti"].xcom_push(key="inference_datetime", value=now_kst_iso())
     ctx["ti"].xcom_push(key="error_count", value=total_errors)
     ctx["ti"].xcom_push(key="threat_dist", value=threat_dist)
 
