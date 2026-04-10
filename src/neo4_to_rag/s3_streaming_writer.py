@@ -11,7 +11,7 @@ from security_metadata.aws_config import (
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-class _S3StreamingWriter:
+class S3StreamingWriter:
     def __init__(self, s3_key: str):
         self._s3_key = s3_key
         self._lines: list[str] = []

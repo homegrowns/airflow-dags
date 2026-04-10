@@ -101,8 +101,21 @@ from src.neo4_to_rag.s3_tmp_helper import (
     s3_read_json,
     s3_delete,
 )
+from src.neo4_to_rag.rag_inference import (
+    fix_json_escapes,
+    parse_response,
+    subgraph_to_text,
+)
 
-from src.neo4_to_rag.s3_streaming_writer import _S3StreamingWriter
+from src.neo4_to_rag.whitelist import (
+    is_whitelisted_session,
+    get_session_src_ip,
+    get_session_flow_start,
+    build_repeat_count_map,
+    calc_suspicion_score,
+)
+
+from src.common.query_v1 import BATCH_QUERY
 
 from src.neo4_to_rag.prompt import SYSTEM_PROMPT
 
@@ -120,267 +133,6 @@ GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"
 # TODO: 디폴트값 넣고 나중에 airlfow variable로 변경 가능하게
 CHUNK_SIZE = 300  # 청크당 세션 수 (= 파드당 처리량)
 MAX_MAP_SIZE = 32  # Airflow Dynamic Task 최대 수 (안전 상한)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# whitelist 로직
-# TODO
-# SUSPICION_THRESHOLD -> Airflow web variable로 관리 추가
-# WHITELIST_IPS -> Configmap으로 관리 추가
-# WHITELIST_CIDRS -> Configmap으로 관리 추가
-# ══════════════════════════════════════════════════════════════════════════════
-
-WHITELIST_IPS: set[str] = {
-    "10.0.0.1",
-    "10.0.0.2",
-    "192.168.0.1",
-    "192.168.0.10",
-}
-WHITELIST_CIDRS: list[str] = ["10.0.2.0/24"]
-SUSPICION_THRESHOLD = 30
-
-
-def _in_whitelist(ip: str | None) -> bool:
-    if not ip:
-        return False
-    if ip in WHITELIST_IPS:
-        return True
-    import ipaddress
-
-    try:
-        addr = ipaddress.ip_address(ip)
-        return any(
-            addr in ipaddress.ip_network(c, strict=False) for c in WHITELIST_CIDRS
-        )
-    except ValueError:
-        return False
-
-
-def _is_whitelisted_session(session: dict) -> bool:
-    if session.get("src_ip") is not None:
-        return _in_whitelist(session["src_ip"])
-    for ev in session.get("timeline", []):
-        if ev.get("source") == "zeek_conn":
-            return _in_whitelist(ev.get("orig_h"))
-        if ev.get("source") == "suricata":
-            return _in_whitelist(ev.get("src_ip"))
-    return False
-
-
-def _get_session_src_ip(session: dict) -> str | None:
-    if session.get("src_ip") is not None:
-        return session["src_ip"]
-    for ev in session.get("timeline", []):
-        if ev.get("source") == "zeek_conn" and ev.get("orig_h"):
-            return ev["orig_h"]
-    for ev in session.get("timeline", []):
-        if ev.get("source") == "suricata" and ev.get("src_ip"):
-            return ev["src_ip"]
-    return None
-
-
-def _get_session_flow_start(session: dict) -> float | None:
-    ts = session.get("flow_start")
-    if not ts:
-        return None
-    if isinstance(ts, (int, float)):
-        v = float(ts)
-        return v / 1000.0 if v > 1e10 else v
-    try:
-        s = str(ts).replace(" ", "T")
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=KST)
-        return dt.astimezone(timezone.utc).timestamp()
-    except Exception:
-        return None
-
-
-REPEAT_WINDOW_SEC = 10
-
-
-def _build_repeat_count_map(sessions: list[dict]) -> dict[str, int]:
-    from collections import defaultdict
-
-    ip_ts: dict[str, list[float]] = defaultdict(list)
-    cid_to_ip: dict[str, str] = {}
-
-    for sess in sessions:
-        src_ip = _get_session_src_ip(sess)
-        ts = _get_session_flow_start(sess)
-        cid = str(sess.get("community_id") or id(sess))
-        if src_ip and ts is not None:
-            ip_ts[src_ip].append(ts)
-            cid_to_ip[cid] = src_ip
-
-    ip_max_count: dict[str, int] = {}
-    for ip, ts_list in ip_ts.items():
-        ts_list.sort()
-        max_count, left = 1, 0
-        for right in range(len(ts_list)):
-            while ts_list[right] - ts_list[left] > REPEAT_WINDOW_SEC:
-                left += 1
-            max_count = max(max_count, right - left + 1)
-        ip_max_count[ip] = max_count
-
-    result: dict[str, int] = {}
-    for sess in sessions:
-        cid = str(sess.get("community_id") or id(sess))
-        src_ip = cid_to_ip.get(cid)
-        result[cid] = ip_max_count.get(src_ip, 1) if src_ip else 1
-    return result
-
-
-def _calc_suspicion_score(session: dict, repeat_count: int = 1) -> int:
-    classtypes: list[str] = []
-    severities: list[int] = []
-    for ev in session.get("timeline", []):
-        if ev.get("source") != "suricata" or not ev.get("signature"):
-            continue
-        ct = CATEGORY_TO_CLASSTYPE.get(ev.get("category", ""), "unknown")
-        classtypes.append(ct)
-        sev = ev.get("severity")
-        if sev is not None:
-            try:
-                severities.append(int(sev))
-            except (ValueError, TypeError):
-                pass
-
-    highest_ct = max(
-        classtypes, key=lambda c: CLASSTYPE_RANK.get(c, 0), default="unknown"
-    )
-    highest_sev = min(severities) if severities else 4
-
-    def _ct_score(ct: str) -> int:
-        HIGH = {
-            "web-application-attack",
-            "trojan-activity",
-            "command-and-control",
-            "misc-attack",
-            "exploit-kit",
-            "shellcode-detect",
-            "targeted-activity",
-            "attempted-admin",
-            "successful-admin",
-            "credential-theft",
-            "domain-c2",
-        }
-        MID = {
-            "bad-unknown",
-            "network-scan",
-            "attempted-user",
-            "successful-user",
-            "policy-violation",
-            "attempted-dos",
-            "denial-of-service",
-            "coin-mining",
-            "social-engineering",
-        }
-        if ct in HIGH:
-            return 30
-        if ct in MID:
-            return 20
-        if ct in {"not-suspicious", "unknown", "tcp-connection"}:
-            return 5
-        return 10
-
-    def _sev_score(s: int) -> int:
-        return {1: 30, 2: 20, 3: 10}.get(s, 0)
-
-    def _repeat_score(cnt: int) -> int:
-        if cnt >= 5:
-            return 20
-        if cnt >= 3:
-            return 10
-        return 0
-
-    return _ct_score(highest_ct) + _sev_score(highest_sev) + _repeat_score(repeat_count)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# RAG 추론 공통 헬퍼
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def _fix_json_escapes(raw: str) -> str:
-    return re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: f"\\u00{m.group(1)}", raw)
-
-
-def _parse_response(raw: str, suspicion_score: int = 0) -> dict:
-    for text in (raw, raw.replace("```json", "").replace("```", "").strip()):
-        try:
-            result = json.loads(text)
-            if "threat_score" not in result:
-                result["threat_score"] = max(0, min(100, int(suspicion_score)))
-            return result
-        except json.JSONDecodeError:
-            pass
-    fixed = _fix_json_escapes(raw)
-    try:
-        result = json.loads(fixed)
-        if "threat_score" not in result:
-            result["threat_score"] = max(0, min(100, int(suspicion_score)))
-        return result
-    except json.JSONDecodeError:
-        pass
-    return {
-        "parse_error": True,
-        "raw_response": raw,
-        "threat_score": max(0, min(100, int(suspicion_score))),
-    }
-
-
-def _subgraph_to_text(subgraph: dict) -> str:
-    s = subgraph["session"]
-    alerts = [
-        ev
-        for ev in s.get("timeline", [])
-        if ev.get("source") == "suricata" and ev.get("signature")
-    ]
-    lines = [
-        "[현재 세션 정보]",
-        f"  session_id   : {s.get('session_id')}",
-        f"  src_ip       : {s.get('src_ip')}  →  dest_ip : {s.get('dest_ip')}",
-        f"  proto        : {s.get('proto')}       port    : {s.get('dest_port')}",
-        f"  alert_count  : {s.get('alert_count')}   max_severity : {s.get('max_severity')}",
-        f"  conn_state   : {s.get('conn_state') or 'N/A'}",
-        f"  tls_sni      : {s.get('tls_sni') or 'N/A'}",
-        f"  http_host    : {s.get('http_host') or 'N/A'}",
-        f"  http_uri     : {s.get('http_uri') or 'N/A'}",
-        f"  http_version : {s.get('http_version') or 'N/A'}",
-        f"  dns_query    : {s.get('dns_query') or 'N/A'}",
-        f"  flow_start   : {s.get('flow_start')}",
-        "",
-    ]
-    if alerts:
-        lines.append("[Suricata Alerts]")
-        for av in alerts:
-            lines.append(
-                f"  severity={av.get('severity')}  "
-                f"category={av.get('category') or 'N/A'}  "
-                f"signature={av.get('signature')}"
-            )
-        lines.append("")
-
-    neighbors = subgraph.get("neighbors", [])
-    if neighbors:
-        lines.append("[Neo4j 과거 행위 (1-hop)]")
-        for nb in neighbors:
-            label = (nb.get("node_labels") or ["?"])[0]
-            value = nb.get("node_value", "")
-            rel = nb.get("rel_type", "")
-            extra = (
-                f"  signature={nb['signature']}  category={nb.get('category')}"
-                if nb.get("signature")
-                else ""
-            )
-            lines.append(f"  -[{rel}]→ :{label} '{value}'{extra}")
-    else:
-        lines.append("[Neo4j 과거 행위] 없음 (신규 세션 또는 미수집)")
-    return "\n".join(lines)
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Task 0 : resolve_session_gold_prefix
@@ -645,29 +397,12 @@ def build_subgraphs(**ctx) -> None:
     session_ids = list(sess_index.keys())
     neighbor_map: dict[str, list[dict]] = {sid: [] for sid in session_ids}
 
-    batch_query = """
-    UNWIND $session_ids AS sid
-    MATCH (s:Session {session_id: sid})-[r]->(n)
-    RETURN
-        sid                       AS session_id,
-        type(r)                   AS rel_type,
-        labels(n)                 AS node_labels,
-        n.value                   AS node_value,
-        n.signature               AS signature,
-        n.category                AS category,
-        n.first_seen              AS first_seen,
-        n.last_seen               AS last_seen,
-        n.related_session_count   AS related_session_count,
-        n.total_orig_bytes        AS total_orig_bytes,
-        n.total_resp_bytes        AS total_resp_bytes
-    """
-
     total_edges = 0
     driver = neo4j_driver()
     with driver.session() as neo_sess:
         for i in range(0, len(session_ids), NEO4J_BATCH_SIZE):
             batch = session_ids[i : i + NEO4J_BATCH_SIZE]
-            result = neo_sess.run(batch_query, session_ids=batch)
+            result = neo_sess.run(BATCH_QUERY, session_ids=batch)
             for record in result:
                 sid = record["session_id"]
                 neighbor_map[sid].append(
@@ -788,6 +523,7 @@ def run_rag_chunk(chunk_info: dict) -> dict:
     반환값: {"result_key": "...", "saved": N, "errors": M, "threat_dist": {...}}
     → merge_rag_results에서 수집
     """
+    from src.neo4_to_rag.s3_streaming_writer import S3StreamingWriter
     from groq import RateLimitError
 
     chunk_key = chunk_info["chunk_key"]

@@ -39,7 +39,7 @@ from airflow.models.xcom import XCom
 from airflow.operators.python import PythonOperator
 from airflow.sdk import Asset
 
-from src.gold_to_neo4j.neo4j.session_query_v1 import (
+from src.common.query_v1 import (
     SESSION_QUERY,
     IP_QUERY,
     DOMAIN_QUERY,

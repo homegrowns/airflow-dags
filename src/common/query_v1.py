@@ -135,3 +135,20 @@ INDEXES: Final[list[str]] = [
     "CREATE INDEX IF NOT EXISTS FOR (n:Alert)   ON (n.category)",
     "CREATE INDEX IF NOT EXISTS FOR (n:Domain)  ON (n.first_seen)",
 ]
+
+BATCH_QUERY: Final[str] = """
+    UNWIND $session_ids AS sid
+    MATCH (s:Session {session_id: sid})-[r]->(n)
+    RETURN
+        sid                       AS session_id,
+        type(r)                   AS rel_type,
+        labels(n)                 AS node_labels,
+        n.value                   AS node_value,
+        n.signature               AS signature,
+        n.category                AS category,
+        n.first_seen              AS first_seen,
+        n.last_seen               AS last_seen,
+        n.related_session_count   AS related_session_count,
+        n.total_orig_bytes        AS total_orig_bytes,
+        n.total_resp_bytes        AS total_resp_bytes
+    """
