@@ -4,6 +4,37 @@ EKS Airflow DAG 모음 — 네트워크 위협 탐지 CTI 파이프라인
 
 ## DAG 구성
 
+```
+repo-root/
+├── dags/
+│   ├── dag_unified_events_to_gold.py
+│   ├── dag_gold_to_neo4j.py
+│   └── dag_neo4j_to_rag.py
+├── plugins/                
+└── src/                    helm value.yaml에서 subPath 추가 필요  
+    ├── __init__.py
+    ├── security_metadata/
+    │   ├── __init__.py
+    │   ├── aws_config.py   aws 설정
+    │   └── mappings.py     CATEGORY_TO_CLASSTYPE , CLASSTYPE_SCORE_RANGE 등 위치
+    ├── common/   
+    │   ├── common_helper.py
+    │   └── query_v1.py
+    │  
+    ├── gold_to_neo4j/
+    │   
+    ├── neo4_to_rag/
+    │   ├── __init__.py
+    │   ├── s3_route_helper.py
+    │   ├── s3_streaming_writer.py
+    │   ├── s3_tmp_helper.py
+    │   └── prompt.py
+    └── unified_to_gold/
+        ├── __init__.py
+        └── gold_parquet_route.py
+
+```
+
 | DAG | 스케줄 | 역할 |
 |---|---|---|
 | `unified_events_to_gold` | `*/10 * * * *` | Silver parquet → Gold parquet 전처리 |
