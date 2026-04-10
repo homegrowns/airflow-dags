@@ -39,9 +39,10 @@ from airflow.models.xcom import XCom
 from airflow.operators.python import PythonOperator
 from airflow.sdk import Asset
 
-from src.gold_to_neo4j.neo4j.session_query_v1 import (SESSION_QUERY, 
-    IP_QUERY, 
-    DOMAIN_QUERY, 
+from src.gold_to_neo4j.neo4j.session_query_v1 import (
+    SESSION_QUERY,
+    IP_QUERY,
+    DOMAIN_QUERY,
     ALERT_QUERY,
     SESSION_CONN_QUERY,
     SESSION_ORIG_QUERY,
@@ -140,6 +141,7 @@ def load_sessions(**ctx) -> None:
     ctx["ti"].xcom_push(key="session_gold_prefix", value=session_gold_prefix)
     logger.info("load_sessions: session_gold prefix → %s", session_gold_prefix)
 
+
 def load_entities(**ctx) -> None:
     session_key: str = ctx["ti"].xcom_pull(task_ids="load_sessions", key="session_key")
     entity_key = sibling_key(session_key, "entity_gold")
@@ -168,6 +170,7 @@ def load_entities(**ctx) -> None:
     total = sum(counts.values())
     logger.info("load_entities 완료 — 총 %d 엔티티", total)
     ctx["ti"].xcom_push(key="entity_count", value=total)
+
 
 def load_relations(**ctx) -> None:
     session_key: str = ctx["ti"].xcom_pull(task_ids="load_sessions", key="session_key")
@@ -219,6 +222,7 @@ def load_relations(**ctx) -> None:
     total = sum(counts.values()) + len(sess_dst) + len(sess_src)
     logger.info("load_relations 완료 — 총 %d 관계", total)
     ctx["ti"].xcom_push(key="relation_count", value=total)
+
 
 def create_indexes(**ctx) -> None:
     driver = neo4j_driver()

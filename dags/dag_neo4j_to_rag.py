@@ -89,15 +89,17 @@ from src.common.common_helper import (
     ms_to_kst_iso,
 )
 
-from src.neo4_to_rag.s3_route_helper import (list_session_gold_keys, 
-    parse_gold_partition, 
-    build_rag_s3_key
+from src.neo4_to_rag.s3_route_helper import (
+    list_session_gold_keys,
+    parse_gold_partition,
+    build_rag_s3_key,
 )
 
-from src.neo4_to_rag.s3_tmp_helper import (s3_tmp_key, 
-    s3_write_json, 
+from src.neo4_to_rag.s3_tmp_helper import (
+    s3_tmp_key,
+    s3_write_json,
     s3_read_json,
-    s3_delete
+    s3_delete,
 )
 
 from src.neo4_to_rag.s3_streaming_writer import _S3StreamingWriter
@@ -328,6 +330,7 @@ def _parse_response(raw: str, suspicion_score: int = 0) -> dict:
         "raw_response": raw,
         "threat_score": max(0, min(100, int(suspicion_score))),
     }
+
 
 def _subgraph_to_text(subgraph: dict) -> str:
     s = subgraph["session"]
