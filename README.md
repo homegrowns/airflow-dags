@@ -10,11 +10,33 @@ repo-root/
 │   ├── dag_unified_events_to_gold.py
 │   ├── dag_gold_to_neo4j.py
 │   └── dag_neo4j_to_rag.py
-└── plugins/                # git-sync가 이 폴더도 동기화하도록 설정
+├── plugins/                # git-sync가 이 폴더도 동기화하도록 설정
+│   ├── __init__.py
+│   └── security_metadata/
+│       ├── __init__.py
+│       ├── aws_config.py
+│       └── mappings.py     # CATEGORY_TO_CLASSTYPE , CLASSTYPE_SCORE_RANGE 등 위치
+└── src/                
     ├── __init__.py
-    └── security_metadata/
-        ├── __init__.py
-        └── mappings.py     # CATEGORY_TO_CLASSTYPE , CLASSTYPE_SCORE_RANGE 등 위치
+    ├── common/   
+    │   ├── common_helper.py
+    │  
+    ├── gold_to_neo4j/
+    │   ├── __init__.py
+    │   └── neo4j/
+    │       ├── __init__.py
+    │       └── session_query_v2.py
+    ├── neo4_to_rag/
+    │   ├── __init__.py
+    │   ├── s3_route_helper.py
+    │   ├── s3_streaming_writer.py
+    │   ├── s3_tmp_helper.py
+    │   └── prompt.py
+    └── unified_to_gold/
+    │   ├── __init__.py
+    │   │
+    │   └── gold_parquet_route.py
+
 ```
 
 | DAG | 스케줄 | 역할 |
