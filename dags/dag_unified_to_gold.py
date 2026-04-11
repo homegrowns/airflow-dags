@@ -147,8 +147,23 @@ def _load_silver_records(ctx) -> list[dict]:
     """
     import pandas as pd
 
-    execution_date: datetime = ctx["logical_date"]
-    prefix = silver_sensor_prefix(execution_date)
+    # ── 테스트 모드: conf에 test_prefix가 있으면 고정 prefix 사용 ──
+    """
+    test_prefix 예시
+    {
+    "test_prefix": "silver/common_records/dt=2026-04-03/hour=22/minute_10=30/batch_seq=00000/"
+    }
+    """
+    conf = ctx["dag_run"].conf or {}
+    test_prefix = conf.get("test_prefix")
+
+    if test_prefix:
+        prefix = test_prefix
+        logger.info("_load_silver_records: 테스트 모드 — prefix=%s", prefix)
+    else:
+        execution_date: datetime = ctx["logical_date"]
+        prefix = silver_sensor_prefix(execution_date)
+
     keys = _list_silver_parquet_keys(prefix)
 
     if not keys:
@@ -281,6 +296,12 @@ def _check_next_partition_exists(**ctx) -> bool:
     다음 minute_10 폴더가 S3에 존재하면 True → 현재 배치 완성으로 판단.
     예) 현재=minute_10=10 → minute_10=20 폴더에 파일 있으면 통과.
     """
+    # ── 테스트 모드: conf에 test_prefix가 있으면 즉시 통과 ──
+    conf = ctx["dag_run"].conf or {}
+    if conf.get("test_prefix"):
+        logger.info("wait_for_silver: test_prefix 감지 → 즉시 통과 (테스트 모드)")
+        return True
+    
     execution_date: datetime = ctx["logical_date"]
     next_prefix = next_silver_prefix(execution_date)
     keys = _list_silver_parquet_keys(next_prefix)
