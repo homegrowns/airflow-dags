@@ -30,12 +30,12 @@ Author : Linda
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
-import hashlib
 from collections import defaultdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -43,30 +43,28 @@ from zoneinfo import ZoneInfo
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
-from airflow.sensors.python import PythonSensor
 from airflow.sdk import Asset
+from airflow.sensors.python import PythonSensor
 
 from src.common.common_helper import (
+    ms_to_kst_iso,
     s3_client,
     to_kst,
-    ms_to_kst_iso,
 )
-
 from src.security_metadata.aws_config import (
-    S3_BUCKET,
     AWS_REGION,
-    S3_SILVER_PREFIX,
-    S3_GOLD_PREFIX,
-    GOLD_SESSION_ASSET,
+    BATCH_SIZE,
     GOLD_ENTITY_ASSET,
     GOLD_RELATION_ASSET,
-    BATCH_SIZE,
+    GOLD_SESSION_ASSET,
+    S3_BUCKET,
+    S3_GOLD_PREFIX,
+    S3_SILVER_PREFIX,
 )
-
 from src.unified_to_gold.gold_parquet_route import (
     gold_s3_key,
-    silver_sensor_prefix,
     next_silver_prefix,
+    silver_sensor_prefix,
 )
 
 # ── S3 설정 ───────────────────────────────────────────────────────────────────
@@ -301,7 +299,7 @@ def _check_next_partition_exists(**ctx) -> bool:
     if conf.get("test_prefix"):
         logger.info("wait_for_silver: test_prefix 감지 → 즉시 통과 (테스트 모드)")
         return True
-    
+
     execution_date: datetime = ctx["logical_date"]
     next_prefix = next_silver_prefix(execution_date)
     keys = _list_silver_parquet_keys(next_prefix)
@@ -317,7 +315,7 @@ def _check_next_partition_exists(**ctx) -> bool:
 
     current_prefix = silver_sensor_prefix(execution_date)
     logger.info(
-        "wait_for_silver: 대기 중\n" "  current: %s\n" "  waiting: %s",
+        "wait_for_silver: 대기 중\n  current: %s\n  waiting: %s",
         current_prefix,
         next_prefix,
     )
@@ -972,14 +970,13 @@ with DAG(
     dag_id="unified_events_to_gold",
     description="Spark silver parquet → session/entity/relation gold 전처리 (v9)",
     default_args=default_args,
-    start_date=datetime(2026, 1, 1),
+    start_date=datetime(2026, 4, 14),
     schedule="*/10 * * * *",
     catchup=False,
     max_active_runs=4,  # 배치 동시 처리
     max_active_tasks=6,
     tags=["cti", "graph-rag", "preprocessing"],
 ) as dag:
-
     # 다음 minute_10 폴더가 생기면 현재 배치 완성으로 판단
     wait_for_silver = PythonSensor(
         task_id="wait_for_silver",
