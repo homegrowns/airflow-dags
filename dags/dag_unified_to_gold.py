@@ -961,7 +961,7 @@ def report_stats(**ctx) -> None:
 default_args = {
     "owner": "linda",
     "depends_on_past": False,
-    "retries": 1,
+    "retries": 3,
     "retry_delay": timedelta(minutes=3),
     "email_on_failure": False,
 }
