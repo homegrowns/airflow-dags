@@ -46,78 +46,55 @@ Author : Linda
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
-import re
 import time
-import hashlib
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-# import threading
-# from concurrent.futures import ThreadPoolExecutor, Future
-
-import boto3
 from airflow import DAG
+from airflow.decorators import task
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator
-from airflow.decorators import task
-from src.security_metadata.mappings import (
-    CATEGORY_TO_CLASSTYPE,
-    CLASSTYPE_SCORE_RANGE,
-    CLASSTYPE_RANK,
-)
-
-from src.security_metadata.aws_config import (
-    S3_BUCKET,
-    S3_SESSION_GOLD_PREFIX,
-    S3_RAG_PREFIX,
-    S3_TMP_PREFIX,
-    AWS_REGION,
-    S3_WRITE_WORKERS,
-)
 
 from src.common.common_helper import (
-    s3_client,
-    neo4j_driver,
     groq_client,
     groq_model,
     make_session_id,
-    now_kst_iso,
     ms_to_kst_iso,
+    neo4j_driver,
+    now_kst_iso,
+    s3_client,
 )
-
-from src.neo4_to_rag.s3_route_helper import (
-    list_session_gold_keys,
-    parse_gold_partition,
-    build_rag_s3_key,
-)
-
-from src.neo4_to_rag.s3_tmp_helper import (
-    s3_tmp_key,
-    s3_write_json,
-    s3_read_json,
-    s3_delete,
-)
+from src.common.query_v1 import BATCH_QUERY
+from src.neo4_to_rag.prompt import SYSTEM_PROMPT
 from src.neo4_to_rag.rag_inference import (
-    fix_json_escapes,
     parse_response,
     subgraph_to_text,
 )
-
+from src.neo4_to_rag.s3_route_helper import (
+    build_rag_s3_key,
+    list_session_gold_keys,
+    parse_gold_partition,
+)
+from src.neo4_to_rag.s3_tmp_helper import (
+    s3_delete,
+    s3_read_json,
+    s3_tmp_key,
+    s3_write_json,
+)
 from src.neo4_to_rag.whitelist import (
-    is_whitelisted_session,
-    get_session_src_ip,
-    get_session_flow_start,
     build_repeat_count_map,
     calc_suspicion_score,
+    is_whitelisted_session,
 )
-
-from src.common.query_v1 import BATCH_QUERY
-
-from src.neo4_to_rag.prompt import SYSTEM_PROMPT
+from src.security_metadata.aws_config import (
+    S3_BUCKET,
+    S3_SESSION_GOLD_PREFIX,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -523,8 +500,9 @@ def run_rag_chunk(chunk_info: dict) -> dict:
     반환값: {"result_key": "...", "saved": N, "errors": M, "threat_dist": {...}}
     → merge_rag_results에서 수집
     """
-    from src.neo4_to_rag.s3_streaming_writer import S3StreamingWriter
     from groq import RateLimitError
+
+    from src.neo4_to_rag.s3_streaming_writer import S3StreamingWriter
 
     chunk_key = chunk_info["chunk_key"]
     chunk_idx = chunk_info["chunk_idx"]
@@ -802,7 +780,6 @@ with DAG(
     max_active_runs=4,
     tags=["graph-rag"],
 ) as dag:
-
     t_resolve = PythonOperator(
         task_id="resolve_session_gold_prefix",
         python_callable=resolve_session_gold_prefix,

@@ -1,5 +1,6 @@
 import hashlib
 import io
+import logging
 from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -14,6 +15,8 @@ from src.security_metadata.aws_config import (
 )
 
 KST = ZoneInfo("Asia/Seoul")
+
+logger = logging.getLogger(__name__)
 
 
 def s3_client():

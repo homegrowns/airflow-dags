@@ -1,6 +1,10 @@
 from collections import defaultdict
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
+from src.security_metadata import CATEGORY_TO_CLASSTYPE, CLASSTYPE_RANK
+
+KST = ZoneInfo("Asia/Seoul")
 # ══════════════════════════════════════════════════════════════════════════════
 # whitelist 로직
 # TODO
@@ -76,14 +80,15 @@ def get_session_flow_start(session: dict) -> float | None:
     except Exception:
         return None
 
+
 def build_repeat_count_map(sessions: list[dict]) -> dict[str, int]:
 
     ip_ts: dict[str, list[float]] = defaultdict(list)
     cid_to_ip: dict[str, str] = {}
 
     for sess in sessions:
-        src_ip = _get_session_src_ip(sess)
-        ts = _get_session_flow_start(sess)
+        src_ip = get_session_src_ip(sess)
+        ts = get_session_flow_start(sess)
         cid = str(sess.get("community_id") or id(sess))
         if src_ip and ts is not None:
             ip_ts[src_ip].append(ts)
@@ -171,4 +176,3 @@ def calc_suspicion_score(session: dict, repeat_count: int = 1) -> int:
         return 0
 
     return _ct_score(highest_ct) + _sev_score(highest_sev) + _repeat_score(repeat_count)
-

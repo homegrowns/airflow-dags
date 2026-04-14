@@ -1,12 +1,16 @@
+import logging
 import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from src.common.common_helper import s3_client
 from src.security_metadata.aws_config import (
     S3_BUCKET,
     S3_RAG_PREFIX,
-    S3_SESSION_GOLD_PREFIX,
 )
 
+KST = ZoneInfo("Asia/Seoul")
+logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════════════════
 # session_gold S3 경로 헬퍼
 # ══════════════════════════════════════════════════════════════════════════════

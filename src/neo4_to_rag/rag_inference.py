@@ -19,7 +19,7 @@ def parse_response(raw: str, suspicion_score: int = 0) -> dict:
             return result
         except json.JSONDecodeError:
             pass
-    fixed = _fix_json_escapes(raw)
+    fixed = fix_json_escapes(raw)
     try:
         result = json.loads(fixed)
         if "threat_score" not in result:

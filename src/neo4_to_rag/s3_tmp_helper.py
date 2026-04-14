@@ -1,12 +1,15 @@
 import json
+import logging
+import re
 from typing import Any
+
 from src.common.common_helper import s3_client
 from src.security_metadata.aws_config import (
     S3_BUCKET,
     S3_TMP_PREFIX,
 )
 
-
+logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════════════════
 # S3 tmp 읽기/쓰기 헬퍼
 # ══════════════════════════════════════════════════════════════════════════════

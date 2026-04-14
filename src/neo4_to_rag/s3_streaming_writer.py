@@ -1,10 +1,18 @@
+import json
+import logging
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor
+from zoneinfo import ZoneInfo
 
 from src.common.common_helper import s3_client
 from src.security_metadata.aws_config import (
     S3_BUCKET,
+    S3_WRITE_WORKERS,
 )
 
+KST = ZoneInfo("Asia/Seoul")
+
+logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════════════════
 # S3StreamingWriter (단일 청크 내 write용)
 # ══════════════════════════════════════════════════════════════════════════════
