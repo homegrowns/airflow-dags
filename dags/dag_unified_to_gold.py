@@ -974,7 +974,7 @@ with DAG(
     schedule="*/10 * * * *",
     catchup=False,
     max_active_runs=4,  # 배치 동시 처리
-    max_active_tasks=6,
+    max_active_tasks=10,
     tags=["cti", "graph-rag", "preprocessing"],
 ) as dag:
     # 다음 minute_10 폴더가 생기면 현재 배치 완성으로 판단
