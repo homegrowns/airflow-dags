@@ -14,6 +14,8 @@ from src.security_metadata.aws_config import (
 
 import boto3
 
+KST = ZoneInfo("Asia/Seoul")
+
 def s3_client():
     return boto3.client("s3", region_name=AWS_REGION)
 
