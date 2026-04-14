@@ -1,20 +1,20 @@
+import hashlib
 import io
 from datetime import datetime, timezone
 from typing import Any
-import hashlib
 from zoneinfo import ZoneInfo
 
+import boto3
 from airflow.models import Variable
 
 from src.security_metadata.aws_config import (
-    S3_BUCKET,
     AWS_REGION,
     BATCH_SIZE,
+    S3_BUCKET,
 )
 
-import boto3
-
 KST = ZoneInfo("Asia/Seoul")
+
 
 def s3_client():
     return boto3.client("s3", region_name=AWS_REGION)
@@ -24,6 +24,7 @@ def s3_client():
 # unified_to_gold 공통 헬퍼
 # TODO: 아래 시간 변환 함수 다 같은거 아닌가?
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def to_kst(dt: datetime) -> datetime:
     if dt.tzinfo is None:
@@ -60,10 +61,11 @@ def ms_to_kst_iso(ms: Any) -> str | None:
 # gold_to_neo4j 공통 헬퍼
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def s3_read_parquet(s3_key: str) -> list[dict]:
     import pandas as pd
 
-    obj = _s3_client().get_object(Bucket=S3_BUCKET, Key=s3_key)
+    obj = s3_client().get_object(Bucket=S3_BUCKET, Key=s3_key)
     df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
     return df.where(df.notna(), None).to_dict(orient="records")
 
@@ -135,9 +137,11 @@ def get_source_run_id(ctx) -> str | None:
         logger.warning("_get_source_run_id: consumed_asset_events 조회 실패 — %s", e)
     return None
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # neo4_to_rag 공통 헬퍼
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def neo4j_driver():
     from neo4j import GraphDatabase
@@ -193,4 +197,3 @@ def now_kst_iso() -> str:
 #         )
 #     except Exception:
 #         return str(ms)
-

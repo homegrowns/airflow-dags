@@ -3,8 +3,8 @@ import re
 from src.common.common_helper import s3_client
 from src.security_metadata.aws_config import (
     S3_BUCKET,
-    S3_SESSION_GOLD_PREFIX,
     S3_RAG_PREFIX,
+    S3_SESSION_GOLD_PREFIX,
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -13,7 +13,7 @@ from src.security_metadata.aws_config import (
 
 
 def list_session_gold_keys(prefix: str) -> list[str]:
-    s3 = _s3_client()
+    s3 = s3_client()
     paginator = s3.get_paginator("list_objects_v2")
     keys: list[str] = []
     for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
@@ -50,7 +50,5 @@ def build_rag_s3_key(partition: dict[str, str]) -> str:
     hour = int(partition["hour"])
     minute = int(partition["minute"])
     return (
-        f"{S3_RAG_PREFIX}/"
-        f"dt={dt}/"
-        f"hour={hour:02d}_minute={minute:02d}_rag_results.jsonl"
+        f"{S3_RAG_PREFIX}/dt={dt}/hour={hour:02d}_minute={minute:02d}_rag_results.jsonl"
     )
