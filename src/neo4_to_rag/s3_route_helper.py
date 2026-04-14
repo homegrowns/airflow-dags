@@ -13,7 +13,7 @@ from src.security_metadata.aws_config import (
 
 
 def list_session_gold_keys(prefix: str) -> list[str]:
-    s3 = _s3_client()
+    s3 = s3_client()
     paginator = s3.get_paginator("list_objects_v2")
     keys: list[str] = []
     for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):

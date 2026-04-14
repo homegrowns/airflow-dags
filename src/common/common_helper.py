@@ -61,7 +61,7 @@ def ms_to_kst_iso(ms: Any) -> str | None:
 def s3_read_parquet(s3_key: str) -> list[dict]:
     import pandas as pd
 
-    obj = _s3_client().get_object(Bucket=S3_BUCKET, Key=s3_key)
+    obj = s3_client().get_object(Bucket=S3_BUCKET, Key=s3_key)
     df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
     return df.where(df.notna(), None).to_dict(orient="records")
 

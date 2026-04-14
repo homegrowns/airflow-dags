@@ -52,7 +52,7 @@ class S3StreamingWriter:
         if lines_snapshot:
             body = "\n".join(lines_snapshot)
             try:
-                _s3_client().put_object(
+                s3_client().put_object(
                     Bucket=S3_BUCKET,
                     Key=self._s3_key,
                     Body=body.encode("utf-8"),
@@ -77,7 +77,7 @@ class S3StreamingWriter:
             f"_checkpoint_{abs(hash(line)) % 100000:05d}.jsonl",
         )
         try:
-            _s3_client().put_object(
+            s3_client().put_object(
                 Bucket=S3_BUCKET,
                 Key=ck_key,
                 Body=(line + "\n").encode("utf-8"),
@@ -93,7 +93,7 @@ class S3StreamingWriter:
             keys = list(self._checkpoint_keys)
         if not keys:
             return
-        s3 = _s3_client()
+        s3 = s3_client()
         BATCH = 1000
         deleted_total = 0
         for i in range(0, len(keys), BATCH):
