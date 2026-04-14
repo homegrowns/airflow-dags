@@ -73,15 +73,6 @@ def s3_read_parquet(s3_key: str) -> list[dict]:
     return df.where(df.notna(), None).to_dict(orient="records")
 
 
-def neo4j_driver():
-    from neo4j import GraphDatabase
-
-    uri = Variable.get("NEO4J_URI")
-    user = Variable.get("NEO4J_USER")
-    pw = Variable.get("NEO4J_PASSWORD")
-    return GraphDatabase.driver(uri, auth=(user, pw))
-
-
 def run_batches(
     session, query: str, records: list[dict], batch_size: int = BATCH_SIZE
 ) -> int:
