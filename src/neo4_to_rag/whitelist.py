@@ -2,7 +2,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-from src.security_metadata import CATEGORY_TO_CLASSTYPE, CLASSTYPE_RANK
+from src.security_metadata.mappings import CATEGORY_TO_CLASSTYPE, CLASSTYPE_RANK
 
 KST = ZoneInfo("Asia/Seoul")
 # ══════════════════════════════════════════════════════════════════════════════
