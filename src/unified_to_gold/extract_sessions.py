@@ -1,3 +1,8 @@
+import json
+
+from src.unified_to_gold.common_utill import make_session_id
+
+
 def extract_conn(row: dict, timeline: list[dict]) -> dict:
     base = {
         "uid": row.get("uid"),
@@ -169,3 +174,65 @@ def extract_suricata_stats(row: dict, timeline: list[dict]) -> dict:
         "bytes_toserver": flow_ev.get("bytes_toserver"),
         "bytes_toclient": flow_ev.get("bytes_toclient"),
     }
+
+
+def extract_sessions(raw_session_list: list[dict]) -> dict:
+    seen_cids: dict[str, str] = {}
+    orphan_idx = 0
+    records: list[dict] = []
+
+    for session in raw_session_list:
+        cid = session.get("community_id")
+        if cid and cid in seen_cids:
+            session_id = seen_cids[cid]
+        elif cid:
+            session_id = make_session_id(cid, 0)
+            seen_cids[cid] = session_id
+        else:
+            session_id = make_session_id(None, orphan_idx)
+            orphan_idx += 1
+
+        timeline = session.get("timeline", [])
+        conn = extract_conn(session, timeline)
+        http = extract_http(timeline)
+        dns = extract_dns(timeline)
+        ssl = extract_ssl(timeline)
+        suri = extract_suricata_stats(session, timeline)
+
+        records.append(
+            {
+                "session_id": session_id,
+                "community_id": cid,
+                "uid": conn.get("uid"),
+                "ts": conn.get("ts"),
+                "src_ip": conn.get("src_ip"),
+                "src_port": conn.get("src_port"),
+                "dest_ip": conn.get("dest_ip"),
+                "dest_port": conn.get("dest_port"),
+                "proto": conn.get("proto"),
+                "service": conn.get("service"),
+                "duration": conn.get("duration"),
+                "orig_bytes": conn.get("orig_bytes"),
+                "resp_bytes": conn.get("resp_bytes"),
+                "conn_state": conn.get("conn_state"),
+                "missed_bytes": conn.get("missed_bytes"),
+                "history": conn.get("history"),
+                "orig_pkts": conn.get("orig_pkts"),
+                "resp_pkts": conn.get("resp_pkts"),
+                **http,
+                **dns,
+                **ssl,
+                "alert_count": suri["alert_count"],
+                "max_severity": suri["max_severity"],
+                "is_threat": session.get("is_threat", False),
+                "timeline": json.dumps(timeline, ensure_ascii=False),
+                "flow_state": suri["flow_state"],
+                "flow_reason": suri["flow_reason"],
+                "pkts_toserver": suri["pkts_toserver"],
+                "pkts_toclient": suri["pkts_toclient"],
+                "bytes_toserver": suri["bytes_toserver"],
+                "bytes_toclient": suri["bytes_toclient"],
+                "flow_start": session.get("flow_start"),
+                "flow_end": session.get("flow_end"),
+            }
+        )

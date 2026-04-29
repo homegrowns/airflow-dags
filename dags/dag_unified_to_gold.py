@@ -53,16 +53,19 @@ from src.security_metadata.aws_config import (
     S3_BUCKET,
 )
 from src.unified_to_gold.common_utill import (
-    check_next_partition_exists,
     is_ip,
+    list_silver_parquet_keys,
     load_silver_records,
     make_session_id,
 )
 from src.unified_to_gold.gold_parquet_route import (
     gold_s3_key,
+    next_silver_prefix,
+    silver_sensor_prefix,
 )
 
-# S3 설정
+# TODO: task 1, 2, 3 해당 raw_session_list 변환하지 말고 DataFrame 유지
+
 KST = ZoneInfo("Asia/Seoul")
 
 GOLD_SESSION_ASSET = Asset(GOLD_SESSION_ASSET)
@@ -124,107 +127,70 @@ def _s3_read_parquet(s3_key: str) -> list[dict]:
     return df.where(df.notna(), None).to_dict(orient="records")
 
 
-# Task 1 : validate_input
-def validate_input(**ctx) -> None:
-    records = load_silver_records(ctx)
-    record_count = len(records)
-    if record_count == 0:
-        raise ValueError("silver parquet 에서 읽은 레코드가 없습니다.")
-    logger.info("validate_input OK — 총 %d 레코드", record_count)
-    ctx["ti"].xcom_push(key="total_lines", value=record_count)
-
-
-# Task 2 : extract_sessions
-def extract_sessions(**ctx) -> None:
-    from src.unified_to_gold.extract_sessions import (
-        extract_conn,
-        extract_dns,
-        extract_http,
-        extract_ssl,
-        extract_suricata_stats,
-    )
+# Sensor : wait_for_silver
+def check_next_partition_exists(**ctx) -> bool:
+    """
+    다음 minute_10 폴더가 S3에 존재하면 True → 현재 배치 완성으로 판단.
+    예) 현재=minute_10=10 → minute_10=20 폴더에 파일 있으면 통과.
+    """
+    # ── 테스트 모드: conf에 test_prefix가 있으면 즉시 통과 ──
+    conf = ctx["dag_run"].conf or {}
+    if conf.get("test_prefix"):
+        logger.info("wait_for_silver: test_prefix 감지 → 즉시 통과 (테스트 모드)")
+        return True
 
     execution_date: datetime = ctx["logical_date"]
-    raw_sessions = load_silver_records(ctx)
+    next_prefix = next_silver_prefix(execution_date)
+    keys = list_silver_parquet_keys(next_prefix)
 
-    seen_cids: dict[str, str] = {}
-    orphan_idx = 0
-    records: list[dict] = []
-
-    for session in raw_sessions:
-        cid = session.get("community_id")
-        if cid and cid in seen_cids:
-            session_id = seen_cids[cid]
-        elif cid:
-            session_id = make_session_id(cid, 0)
-            seen_cids[cid] = session_id
-        else:
-            session_id = make_session_id(None, orphan_idx)
-            orphan_idx += 1
-
-        timeline = session.get("timeline", [])
-        conn = extract_conn(session, timeline)
-        http = extract_http(timeline)
-        dns = extract_dns(timeline)
-        ssl = extract_ssl(timeline)
-        suri = extract_suricata_stats(session, timeline)
-
-        records.append(
-            {
-                "session_id": session_id,
-                "community_id": cid,
-                "uid": conn.get("uid"),
-                "ts": conn.get("ts"),
-                "src_ip": conn.get("src_ip"),
-                "src_port": conn.get("src_port"),
-                "dest_ip": conn.get("dest_ip"),
-                "dest_port": conn.get("dest_port"),
-                "proto": conn.get("proto"),
-                "service": conn.get("service"),
-                "duration": conn.get("duration"),
-                "orig_bytes": conn.get("orig_bytes"),
-                "resp_bytes": conn.get("resp_bytes"),
-                "conn_state": conn.get("conn_state"),
-                "missed_bytes": conn.get("missed_bytes"),
-                "history": conn.get("history"),
-                "orig_pkts": conn.get("orig_pkts"),
-                "resp_pkts": conn.get("resp_pkts"),
-                **http,
-                **dns,
-                **ssl,
-                "alert_count": suri["alert_count"],
-                "max_severity": suri["max_severity"],
-                "is_threat": session.get("is_threat", False),
-                "timeline": json.dumps(timeline, ensure_ascii=False),
-                "flow_state": suri["flow_state"],
-                "flow_reason": suri["flow_reason"],
-                "pkts_toserver": suri["pkts_toserver"],
-                "pkts_toclient": suri["pkts_toclient"],
-                "bytes_toserver": suri["bytes_toserver"],
-                "bytes_toclient": suri["bytes_toclient"],
-                "flow_start": session.get("flow_start"),
-                "flow_end": session.get("flow_end"),
-            }
+    if keys:
+        logger.info(
+            "wait_for_silver: 다음 파티션 감지 → 현재 배치 완성 판단\n"
+            "  next_prefix: %s (%d개)",
+            next_prefix,
+            len(keys),
         )
+        return True
+
+    current_prefix = silver_sensor_prefix(execution_date)
+    logger.info(
+        "wait_for_silver: 대기 중\n  current: %s\n  waiting: %s",
+        current_prefix,
+        next_prefix,
+    )
+    return False
+
+
+# Task 1 : extract_sessions
+def extract_sessions(**ctx) -> None:
+    from src.unified_to_gold.extract_sessions import extract_sessions
+
+    execution_date: datetime = ctx["logical_date"]
+    raw_session_list = load_silver_records(ctx)
+
+    if not raw_session_list:
+        raise ValueError("silver parquet 에서 읽은 레코드가 없습니다.")
+
+    records = extract_sessions(raw_session_list)
 
     session_key = gold_s3_key("session_gold", execution_date)
     _s3_write_parquet(session_key, records)
     logger.info("extract_sessions 완료 — %d 세션 → %s", len(records), session_key)
     ctx["ti"].xcom_push(key="session_key", value=session_key)
     ctx["ti"].xcom_push(key="session_count", value=len(records))
+    ctx["ti"].xcom_push(key="total_lines", value=len(records))
 
 
-# Task 3 : extract_entities
-# TODO 데이터 전처리  Polars 고려
+# Task 2 : extract_entities
 def extract_entities(**ctx) -> None:
     from src.unified_to_gold.extract_entities import extract_entities
 
     execution_date: datetime = ctx["logical_date"]
     session_key = ctx["ti"].xcom_pull(task_ids="extract_sessions", key="session_key")
-    sessions_df = _s3_read_parquet(session_key)
-    raw_df = load_silver_records(ctx)
+    sessions_list = _s3_read_parquet(session_key)
+    raw_session_list = load_silver_records(ctx)
 
-    records = extract_entities(sessions_df=sessions_df, raw_df=raw_df)
+    records = extract_entities(sessions_list=sessions_list, raw_list=raw_session_list)
 
     entity_key = gold_s3_key("entity_gold", execution_date)
 
@@ -234,12 +200,12 @@ def extract_entities(**ctx) -> None:
     ctx["ti"].xcom_push(key="entity_count", value=len(records))
 
 
-# Task 4 : extract_relations
+# Task 3 : extract_relations
 def extract_relations(**ctx) -> None:
     execution_date: datetime = ctx["logical_date"]
     session_key = ctx["ti"].xcom_pull(task_ids="extract_sessions", key="session_key")
     sessions = _s3_read_parquet(session_key)
-    raw = load_silver_records(ctx)
+    raw_session_list = load_silver_records(ctx)
     cid_to_sid = {
         s["community_id"]: s["session_id"] for s in sessions if s.get("community_id")
     }
@@ -303,7 +269,7 @@ def extract_relations(**ctx) -> None:
                     elif ans != dns_query:
                         _add("domain", dns_query, "RESOLVED_BY", "domain", ans, sid)
 
-    for raw_sess in raw:
+    for raw_sess in raw_session_list:
         sid = cid_to_sid.get(raw_sess.get("community_id"), "unknown")
         for ev in raw_sess.get("timeline", []):
             source = ev.get("source", "")
@@ -354,11 +320,11 @@ def extract_relations(**ctx) -> None:
     ctx["ti"].xcom_push(key="relation_count", value=len(records))
 
 
-# Task 5 : report_stats
+# Task 4 : report_stats
 # TODO: _s3_read_parquet 제거 xcom_pull -> TaskFlow API 활용방안
 def report_stats(**ctx) -> None:
     ti = ctx["ti"]
-    total_lines = ti.xcom_pull(task_ids="validate_input", key="total_lines")
+    total_lines = ti.xcom_pull(task_ids="extract_sessions", key="total_lines")
     session_count = ti.xcom_pull(task_ids="extract_sessions", key="session_count")
     entity_count = ti.xcom_pull(task_ids="extract_entities", key="entity_count")
     relation_count = ti.xcom_pull(task_ids="extract_relations", key="relation_count")
@@ -426,9 +392,6 @@ with DAG(
         mode="poke",
     )
 
-    t_validate = PythonOperator(
-        task_id="validate_input", python_callable=validate_input
-    )
     t_sessions = PythonOperator(
         task_id="extract_sessions", python_callable=extract_sessions
     )
@@ -460,6 +423,6 @@ with DAG(
         reset_dag_run=True,
     )
 
-    wait_for_silver >> t_validate >> t_sessions
+    wait_for_silver >> t_sessions
     t_sessions >> t_trigger_rag
     t_sessions >> t_entities >> t_relations >> t_report

@@ -19,7 +19,7 @@ def _update_ip(ip, ts, sid, orig=0, resp=0):
         {
             "first_seen": ts,
             "last_seen": ts,
-            "sessions_df": set(),
+            "sessions_list": set(),
             "orig_bytes": 0,
             "resp_bytes": 0,
         },
@@ -29,7 +29,7 @@ def _update_ip(ip, ts, sid, orig=0, resp=0):
             b["first_seen"] = ts
         if not b["last_seen"] or ts > b["last_seen"]:
             b["last_seen"] = ts
-    b["sessions_df"].add(sid)
+    b["sessions_list"].add(sid)
     b["orig_bytes"] += orig
     b["resp_bytes"] += resp
 
@@ -42,7 +42,7 @@ def _update_domain(domain, ts, sid):
         {
             "first_seen": ts,
             "last_seen": ts,
-            "sessions_df": set(),
+            "sessions_list": set(),
         },
     )
     if ts:
@@ -50,7 +50,7 @@ def _update_domain(domain, ts, sid):
             b["first_seen"] = ts
         if not b["last_seen"] or ts > b["last_seen"]:
             b["last_seen"] = ts
-    b["sessions_df"].add(sid)
+    b["sessions_list"].add(sid)
 
 
 def _update_alert(sig_id, sig, category, severity, ts, sid):
@@ -62,7 +62,7 @@ def _update_alert(sig_id, sig, category, severity, ts, sid):
         {
             "first_seen": ts,
             "last_seen": ts,
-            "sessions_df": set(),
+            "sessions_list": set(),
             "signature": sig,
             "signature_id": sig_id,
             "category": category,
@@ -73,15 +73,15 @@ def _update_alert(sig_id, sig, category, severity, ts, sid):
             b["first_seen"] = ts
         if not b["last_seen"] or ts > b["last_seen"]:
             b["last_seen"] = ts
-    b["sessions_df"].add(sid)
+    b["sessions_list"].add(sid)
 
 
 def extract_entities(
-    sessions_df: pd.DataFrame,
-    raw_df: pd.DataFrame,
+    sessions_list: list[dict],
+    raw_list: list[dict],
 ) -> list[dict[str, Any]]:
 
-    for sess in sessions_df:
+    for sess in sessions_list:
         sid = sess["session_id"]
         ts = sess.get("flow_start")
         _update_ip(sess.get("src_ip"), ts, sid)
@@ -95,12 +95,14 @@ def extract_entities(
             _update_domain(sess["dns_query"], ts, sid)
 
     cid_to_sid = {
-        s["community_id"]: s["session_id"] for s in sessions_df if s.get("community_id")
+        s["community_id"]: s["session_id"]
+        for s in sessions_list
+        if s.get("community_id")
     }
 
-    for raw_df_sess in raw_df:
-        sid = cid_to_sid.get(raw_df_sess.get("community_id"), "unknown")
-        for ev in raw_df_sess.get("timeline", []):
+    for raw_list_sess in raw_list:
+        sid = cid_to_sid.get(raw_list_sess.get("community_id"), "unknown")
+        for ev in raw_list_sess.get("timeline", []):
             source = ev.get("source", "")
             ts = ev.get("ts")
             if source == "zeek_conn":
@@ -120,9 +122,9 @@ def extract_entities(
                     )
             elif source == "zeek_dns":
                 _update_domain(ev.get("query"), ts, sid)
-                answers_raw_df = ev.get("answers")
-                if answers_raw_df:
-                    for ans in str(answers_raw_df).split(","):
+                answers_raw_list = ev.get("answers")
+                if answers_raw_list:
+                    for ans in str(answers_raw_list).split(","):
                         ans = ans.strip()
                         if not ans:
                             continue
@@ -144,7 +146,7 @@ def extract_entities(
                 "entity_value": ip,
                 "first_seen": b["first_seen"],
                 "last_seen": b["last_seen"],
-                "related_session_count": len(b["sessions_df"]),
+                "related_session_count": len(b["sessions_list"]),
                 "total_orig_bytes": b["orig_bytes"],
                 "total_resp_bytes": b["resp_bytes"],
                 "signature": None,
@@ -158,7 +160,7 @@ def extract_entities(
                 "entity_value": domain,
                 "first_seen": b["first_seen"],
                 "last_seen": b["last_seen"],
-                "related_session_count": len(b["sessions_df"]),
+                "related_session_count": len(b["sessions_list"]),
                 "total_orig_bytes": None,
                 "total_resp_bytes": None,
                 "signature": None,
@@ -172,7 +174,7 @@ def extract_entities(
                 "entity_value": key,
                 "first_seen": b["first_seen"],
                 "last_seen": b["last_seen"],
-                "related_session_count": len(b["sessions_df"]),
+                "related_session_count": len(b["sessions_list"]),
                 "total_orig_bytes": None,
                 "total_resp_bytes": None,
                 "signature": b["signature"],

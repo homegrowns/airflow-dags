@@ -10,10 +10,7 @@ from src.common.common_helper import (
     s3_client,
 )
 from src.security_metadata.aws_config import S3_BUCKET
-from src.unified_to_gold.gold_parquet_route import (
-    next_silver_prefix,
-    silver_sensor_prefix,
-)
+from src.unified_to_gold.gold_parquet_route import silver_sensor_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -176,37 +173,3 @@ def make_session_id(community_id: str | None, idx: int) -> str:
 def is_ip(value: str) -> bool:
     parts = value.split(".")
     return len(parts) == 4 and all(p.isdigit() for p in parts)
-
-
-# Sensor : wait_for_silver
-def check_next_partition_exists(**ctx) -> bool:
-    """
-    다음 minute_10 폴더가 S3에 존재하면 True → 현재 배치 완성으로 판단.
-    예) 현재=minute_10=10 → minute_10=20 폴더에 파일 있으면 통과.
-    """
-    # ── 테스트 모드: conf에 test_prefix가 있으면 즉시 통과 ──
-    conf = ctx["dag_run"].conf or {}
-    if conf.get("test_prefix"):
-        logger.info("wait_for_silver: test_prefix 감지 → 즉시 통과 (테스트 모드)")
-        return True
-
-    execution_date: datetime = ctx["logical_date"]
-    next_prefix = next_silver_prefix(execution_date)
-    keys = list_silver_parquet_keys(next_prefix)
-
-    if keys:
-        logger.info(
-            "wait_for_silver: 다음 파티션 감지 → 현재 배치 완성 판단\n"
-            "  next_prefix: %s (%d개)",
-            next_prefix,
-            len(keys),
-        )
-        return True
-
-    current_prefix = silver_sensor_prefix(execution_date)
-    logger.info(
-        "wait_for_silver: 대기 중\n  current: %s\n  waiting: %s",
-        current_prefix,
-        next_prefix,
-    )
-    return False
