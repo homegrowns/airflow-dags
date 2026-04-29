@@ -9,7 +9,7 @@ S3 silver/common_records (Spark 파티션 parquet) → session_gold / entity_gol
     · 예) minute_10=10 처리 중 → minute_10=20 폴더 감지되면 통과
   - _silver_sensor_prefix / _gold_s3_key: KST 변환 적용
   - _ms_to_iso → ms_to_kst_iso (KST 변환)
-  - _load_silver_records fallback 제거 (wait_for_silver 통과 후 없으면 에러)
+  - load_silver_records fallback 제거 (wait_for_silver 통과 후 없으면 에러)
   - TriggerDagRunOperator: neo4j_to_rag 트리거 (session_key conf 전달)
 
 Pipeline:
@@ -30,14 +30,11 @@ Author : Linda
 
 from __future__ import annotations
 
-import hashlib
 import io
 import json
 import logging
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from airflow import DAG
@@ -47,28 +44,25 @@ from airflow.sdk import Asset
 from airflow.sensors.python import PythonSensor
 
 from src.common.common_helper import (
-    ms_to_kst_iso,
     s3_client,
-    to_kst,
 )
 from src.security_metadata.aws_config import (
-    AWS_REGION,
-    BATCH_SIZE,
     GOLD_ENTITY_ASSET,
     GOLD_RELATION_ASSET,
     GOLD_SESSION_ASSET,
     S3_BUCKET,
-    S3_GOLD_PREFIX,
-    S3_SILVER_PREFIX,
+)
+from src.unified_to_gold.common_utill import (
+    check_next_partition_exists,
+    is_ip,
+    load_silver_records,
+    make_session_id,
 )
 from src.unified_to_gold.gold_parquet_route import (
     gold_s3_key,
-    next_silver_prefix,
-    silver_sensor_prefix,
 )
 
-# ── S3 설정 ───────────────────────────────────────────────────────────────────
-
+# S3 설정
 KST = ZoneInfo("Asia/Seoul")
 
 GOLD_SESSION_ASSET = Asset(GOLD_SESSION_ASSET)
@@ -78,9 +72,7 @@ GOLD_RELATION_ASSET = Asset(GOLD_RELATION_ASSET)
 logger = logging.getLogger(__name__)
 
 
-# ── parquet 읽기/쓰기 ─────────────────────────────────────────────────────────
-
-
+# parquet 읽기/쓰기
 def _s3_write_parquet(s3_key: str, records: list[dict]) -> None:
     import pandas as pd
 
@@ -120,215 +112,9 @@ def _s3_read_parquet(s3_key: str) -> list[dict]:
     return df.where(df.notna(), None).to_dict(orient="records")
 
 
-# ── silver prefix 헬퍼 ────────────────────────────────────────────────────────
-
-
-def _list_silver_parquet_keys(prefix: str) -> list[str]:
-    s3 = s3_client()
-    paginator = s3.get_paginator("list_objects_v2")
-    keys: list[str] = []
-    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith(".parquet") and "_SUCCESS" not in key:
-                keys.append(key)
-    return keys
-
-
-# ── silver parquet 로딩 공통 헬퍼 ────────────────────────────────────────────
-
-
-def _load_silver_records(ctx) -> list[dict]:
-    """
-    DAG 실행 시각 기준 silver prefix 내 parquet 전체 읽기
-    → community_id 기준 통합 → list[dict] 반환.
-    """
-    import pandas as pd
-
-    # ── 테스트 모드: conf에 test_prefix가 있으면 고정 prefix 사용 ──
-    """
-    test_prefix 예시
-    {
-    "test_prefix": "silver/common_records/dt=2026-04-03/hour=22/minute_10=30/batch_seq=00000/"
-    }
-    """
-    conf = ctx["dag_run"].conf or {}
-    test_prefix = conf.get("test_prefix")
-
-    if test_prefix:
-        prefix = test_prefix
-        logger.info("_load_silver_records: 테스트 모드 — prefix=%s", prefix)
-    else:
-        execution_date: datetime = ctx["logical_date"]
-        prefix = silver_sensor_prefix(execution_date)
-
-    keys = _list_silver_parquet_keys(prefix)
-
-    if not keys:
-        # wait_for_silver 통과 후 여기 오면 안 됨
-        raise ValueError(f"silver parquet 없음 — prefix: {prefix}")
-
-    s3 = s3_client()
-    frames: list = []
-    for key in keys:
-        try:
-            obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
-            frames.append(pd.read_parquet(io.BytesIO(obj["Body"].read())))
-        except Exception as e:
-            logger.warning("parquet 읽기 실패 — %s: %s", key, e)
-
-    if not frames:
-        raise ValueError("읽을 수 있는 silver parquet 파일이 없습니다.")
-
-    df = pd.concat(frames, ignore_index=True)
-    df = df.drop(
-        columns=[c for c in ("dt", "hour", "batch_seq", "minute_10") if c in df.columns]
-    )
-    if "flow_start" in df.columns:
-        df = df.sort_values("flow_start", na_position="last")
-
-    def _convert(v: Any) -> Any:
-        if isinstance(v, float) and v != v:
-            return None
-        if isinstance(v, bool):
-            return v
-        if isinstance(v, (int, str)):
-            return v
-        if hasattr(v, "item"):
-            return v.item()
-        if isinstance(v, list):
-            return v
-        return v
-
-    NUMERIC_FIELDS = (
-        "uid",
-        "flow_id",
-        "src_ip",
-        "src_port",
-        "dest_ip",
-        "dest_port",
-        "proto",
-        "service",
-        "is_threat",
-        "alert_count",
-        "threat_level",
-    )
-
-    merged: dict[str, dict] = {}
-    orphan_idx = 0
-
-    for _, row in df.iterrows():
-        record: dict[str, Any] = {k: _convert(v) for k, v in row.to_dict().items()}
-        record["flow_start"] = ms_to_kst_iso(record.get("flow_start"))
-        record["flow_end"] = ms_to_kst_iso(record.get("flow_end"))
-
-        tl_raw = record.get("timeline", [])
-        if isinstance(tl_raw, str):
-            try:
-                tl_parsed = json.loads(tl_raw)
-                if not isinstance(tl_parsed, list):
-                    tl_parsed = []
-            except json.JSONDecodeError:
-                tl_parsed = []
-        elif isinstance(tl_raw, list):
-            tl_parsed = tl_raw
-        else:
-            tl_parsed = []
-        record["timeline"] = tl_parsed
-
-        cid = record.get("community_id")
-        if not cid:
-            merged[f"_orphan_{orphan_idx}"] = record
-            orphan_idx += 1
-            continue
-
-        if cid not in merged:
-            merged[cid] = record
-        else:
-            ex = merged[cid]
-            ex["timeline"] = ex.get("timeline", []) + tl_parsed
-            for f in NUMERIC_FIELDS:
-                if record.get(f) is not None:
-                    ex[f] = record[f]
-            fs_old, fs_new = ex.get("flow_start"), record.get("flow_start")
-            if fs_old and fs_new:
-                ex["flow_start"] = min(fs_old, fs_new)
-            elif fs_new:
-                ex["flow_start"] = fs_new
-            fe_old, fe_new = ex.get("flow_end"), record.get("flow_end")
-            if fe_old and fe_new:
-                ex["flow_end"] = max(fe_old, fe_new)
-            elif fe_new:
-                ex["flow_end"] = fe_new
-
-    records = list(merged.values())
-    logger.info(
-        "_load_silver_records 완료 — community_id 기준 %d 레코드 (prefix: %s)",
-        len(records),
-        prefix,
-    )
-    return records
-
-
-# ── 공통 유틸 ─────────────────────────────────────────────────────────────────
-
-
-def _make_session_id(community_id: str | None, idx: int) -> str:
-    if community_id:
-        return f"s_{hashlib.sha1(community_id.encode()).hexdigest()[:8]}"
-    return f"s_orphan_{idx:04d}"
-
-
-def _is_ip(value: str) -> bool:
-    parts = value.split(".")
-    return len(parts) == 4 and all(p.isdigit() for p in parts)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Sensor : wait_for_silver
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def _check_next_partition_exists(**ctx) -> bool:
-    """
-    다음 minute_10 폴더가 S3에 존재하면 True → 현재 배치 완성으로 판단.
-    예) 현재=minute_10=10 → minute_10=20 폴더에 파일 있으면 통과.
-    """
-    # ── 테스트 모드: conf에 test_prefix가 있으면 즉시 통과 ──
-    conf = ctx["dag_run"].conf or {}
-    if conf.get("test_prefix"):
-        logger.info("wait_for_silver: test_prefix 감지 → 즉시 통과 (테스트 모드)")
-        return True
-
-    execution_date: datetime = ctx["logical_date"]
-    next_prefix = next_silver_prefix(execution_date)
-    keys = _list_silver_parquet_keys(next_prefix)
-
-    if keys:
-        logger.info(
-            "wait_for_silver: 다음 파티션 감지 → 현재 배치 완성 판단\n"
-            "  next_prefix: %s (%d개)",
-            next_prefix,
-            len(keys),
-        )
-        return True
-
-    current_prefix = silver_sensor_prefix(execution_date)
-    logger.info(
-        "wait_for_silver: 대기 중\n  current: %s\n  waiting: %s",
-        current_prefix,
-        next_prefix,
-    )
-    return False
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # Task 1 : validate_input
-# ══════════════════════════════════════════════════════════════════════════════
-
-
 def validate_input(**ctx) -> None:
-    records = _load_silver_records(ctx)
+    records = load_silver_records(ctx)
     record_count = len(records)
     if record_count == 0:
         raise ValueError("silver parquet 에서 읽은 레코드가 없습니다.")
@@ -336,11 +122,7 @@ def validate_input(**ctx) -> None:
     ctx["ti"].xcom_push(key="total_lines", value=record_count)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Task 2 : extract_sessions
-# ══════════════════════════════════════════════════════════════════════════════
-
-
 def _extract_conn(row: dict, timeline: list[dict]) -> dict:
     base = {
         "uid": row.get("uid"),
@@ -516,7 +298,7 @@ def _extract_suricata_stats(row: dict, timeline: list[dict]) -> dict:
 
 def extract_sessions(**ctx) -> None:
     execution_date: datetime = ctx["logical_date"]
-    raw_sessions = _load_silver_records(ctx)
+    raw_sessions = load_silver_records(ctx)
 
     seen_cids: dict[str, str] = {}
     orphan_idx = 0
@@ -527,10 +309,10 @@ def extract_sessions(**ctx) -> None:
         if cid and cid in seen_cids:
             session_id = seen_cids[cid]
         elif cid:
-            session_id = _make_session_id(cid, 0)
+            session_id = make_session_id(cid, 0)
             seen_cids[cid] = session_id
         else:
-            session_id = _make_session_id(None, orphan_idx)
+            session_id = make_session_id(None, orphan_idx)
             orphan_idx += 1
 
         timeline = session.get("timeline", [])
@@ -585,17 +367,13 @@ def extract_sessions(**ctx) -> None:
     ctx["ti"].xcom_push(key="session_count", value=len(records))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Task 3 : extract_entities
 # TODO 데이터 전처리 panda or Polars 고려
-# ══════════════════════════════════════════════════════════════════════════════
-
-
 def extract_entities(**ctx) -> None:
     execution_date: datetime = ctx["logical_date"]
     session_key = ctx["ti"].xcom_pull(task_ids="extract_sessions", key="session_key")
     sessions = _s3_read_parquet(session_key)
-    raw = _load_silver_records(ctx)
+    raw = load_silver_records(ctx)
 
     ip_bucket: dict[str, dict] = {}
     domain_bucket: dict[str, dict] = {}
@@ -670,7 +448,7 @@ def extract_entities(**ctx) -> None:
         _update_ip(sess.get("dest_ip"), ts, sid)
         http_host = sess.get("http_host")
         if http_host:
-            (_update_ip if _is_ip(http_host) else _update_domain)(http_host, ts, sid)
+            (_update_ip if is_ip(http_host) else _update_domain)(http_host, ts, sid)
         if sess.get("tls_sni"):
             _update_domain(sess["tls_sni"], ts, sid)
         if sess.get("dns_query"):
@@ -775,16 +553,12 @@ def extract_entities(**ctx) -> None:
     ctx["ti"].xcom_push(key="entity_count", value=len(records))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Task 4 : extract_relations
-# ══════════════════════════════════════════════════════════════════════════════
-
-
 def extract_relations(**ctx) -> None:
     execution_date: datetime = ctx["logical_date"]
     session_key = ctx["ti"].xcom_pull(task_ids="extract_sessions", key="session_key")
     sessions = _s3_read_parquet(session_key)
-    raw = _load_silver_records(ctx)
+    raw = load_silver_records(ctx)
     cid_to_sid = {
         s["community_id"]: s["session_id"] for s in sessions if s.get("community_id")
     }
@@ -826,7 +600,7 @@ def extract_relations(**ctx) -> None:
                 "ip",
                 src_ip,
                 "REQUESTED",
-                "ip" if _is_ip(http_host) else "domain",
+                "ip" if is_ip(http_host) else "domain",
                 http_host,
                 sid,
             )
@@ -899,11 +673,7 @@ def extract_relations(**ctx) -> None:
     ctx["ti"].xcom_push(key="relation_count", value=len(records))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Task 5 : report_stats
-# ══════════════════════════════════════════════════════════════════════════════
-
-
 def report_stats(**ctx) -> None:
     ti = ctx["ti"]
     total_lines = ti.xcom_pull(task_ids="validate_input", key="total_lines")
@@ -954,10 +724,7 @@ def report_stats(**ctx) -> None:
     logger.info("=" * 65)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # DAG 정의
-# ══════════════════════════════════════════════════════════════════════════════
-
 default_args = {
     "owner": "linda",
     "depends_on_past": False,
@@ -980,7 +747,7 @@ with DAG(
     # 다음 minute_10 폴더가 생기면 현재 배치 완성으로 판단
     wait_for_silver = PythonSensor(
         task_id="wait_for_silver",
-        python_callable=_check_next_partition_exists,
+        python_callable=check_next_partition_exists,
         poke_interval=60,
         timeout=60 * 60,  # 최대 1시간 대기
         mode="poke",

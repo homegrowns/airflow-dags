@@ -106,16 +106,14 @@ GROQ_RPM_SLEEP = 2.0
 GROQ_MODEL_DEFAULT = "llama-3.3-70b-versatile"
 GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"
 
-# ── Dynamic Task Mapping 설정 ──────────────────────────────────────────────────
+# ── Dynamic Task Mapping 설정
 # TODO: 디폴트값 넣고 나중에 airlfow variable로 변경 가능하게
 CHUNK_SIZE = 300  # 청크당 세션 수 (= 파드당 처리량)
 MAX_MAP_SIZE = 32  # Airflow Dynamic Task 최대 수 (안전 상한)
 SUSPICION_THRESHOLD = 30
-# ══════════════════════════════════════════════════════════════════════════════
+
+
 # Task 0 : resolve_session_gold_prefix
-# ══════════════════════════════════════════════════════════════════════════════
-
-
 def resolve_session_gold_prefix(**ctx) -> None:
     conf = ctx["dag_run"].conf or {}
     session_key = conf.get("session_key", "")
@@ -156,11 +154,7 @@ def resolve_session_gold_prefix(**ctx) -> None:
     ctx["ti"].xcom_push(key="gold_partition", value=partition)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Task 1 : load_session_gold
-# ══════════════════════════════════════════════════════════════════════════════
-
-
 def load_session_gold(**ctx) -> None:
     import pandas as pd
 
@@ -204,7 +198,7 @@ def load_session_gold(**ctx) -> None:
         columns=[c for c in ("dt", "hour", "batch_seq", "minute_10") if c in df.columns]
     )
 
-    # ── flow_start / flow_end KST 변환 (벡터화) ──────────────────────────────
+    # flow_start / flow_end KST 변환 (벡터화)
     for col in ("flow_start", "flow_end"):
         if col in df.columns:
             df[col] = (
@@ -213,10 +207,10 @@ def load_session_gold(**ctx) -> None:
                 .dt.strftime("%Y-%m-%dT%H:%M:%S%z")
             )
 
-    # ── NaN → None 일괄 변환 ─────────────────────────────────────────────────
+    # NaN → None 일괄 변환
     df = df.where(df.notna(), other=None)
 
-    # ── timeline 파싱 + 이벤트 ts KST 변환 ───────────────────────────────────
+    # timeline 파싱 + 이벤트 ts KST 변환
     def _parse_timeline(v):
         if isinstance(v, str):
             try:
@@ -241,7 +235,7 @@ def load_session_gold(**ctx) -> None:
     else:
         df["timeline"] = [[] for _ in range(len(df))]
 
-    # ── community_id 기준 병합 ────────────────────────────────────────────────
+    # community_id 기준 병합
     NUMERIC_FIELDS = {
         "uid",
         "flow_id",
@@ -300,11 +294,7 @@ def load_session_gold(**ctx) -> None:
     ctx["ti"].xcom_push(key="total_loaded", value=len(raw_sessions))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Task 2 : filter_whitelist
-# ══════════════════════════════════════════════════════════════════════════════
-
-
 def filter_whitelist(**ctx) -> None:
     run_id: str = ctx["run_id"]
 
@@ -346,11 +336,7 @@ def filter_whitelist(**ctx) -> None:
     ctx["ti"].xcom_push(key="filter_stats", value=filtered)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Task 3 : build_subgraphs
-# ══════════════════════════════════════════════════════════════════════════════
-
-
 def build_subgraphs(**ctx) -> None:
     run_id: str = ctx["run_id"]
 
@@ -423,12 +409,8 @@ def build_subgraphs(**ctx) -> None:
     ctx["ti"].xcom_push(key="subgraphs_s3_key", value=tmp_key)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Task 4 : split_subgraphs  ← Dynamic Task Mapping 준비
 # 서브그래프를 CHUNK_SIZE개씩 S3에 저장하고 chunk_key 리스트를 반환
-# ══════════════════════════════════════════════════════════════════════════════
-
-
 @task
 def split_subgraphs(**ctx) -> list[dict]:
     """
@@ -488,11 +470,7 @@ def split_subgraphs(**ctx) -> list[dict]:
     return chunk_infos
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Task 5 : run_rag_chunk  ← Dynamic Task Mapping 실행 단위 (파드 1개)
-# ══════════════════════════════════════════════════════════════════════════════
-
-
 @task
 def run_rag_chunk(chunk_info: dict) -> dict:
     """
@@ -639,11 +617,7 @@ def run_rag_chunk(chunk_info: dict) -> dict:
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Task 6 : merge_rag_results  ← 각 청크 결과 JSONL 병합
-# ══════════════════════════════════════════════════════════════════════════════
-
-
 @task
 def merge_rag_results(chunk_results: list[dict], **ctx) -> None:
     """
@@ -720,11 +694,7 @@ def merge_rag_results(chunk_results: list[dict], **ctx) -> None:
     )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Task 7 : report_rag_stats
-# ══════════════════════════════════════════════════════════════════════════════
-
-
 def report_rag_stats(**ctx) -> None:
     ti = ctx["ti"]
 
@@ -758,10 +728,7 @@ def report_rag_stats(**ctx) -> None:
     logger.info("=" * 70)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # DAG 정의
-# ══════════════════════════════════════════════════════════════════════════════
-
 default_args = {
     "owner": "linda",
     "depends_on_past": False,
