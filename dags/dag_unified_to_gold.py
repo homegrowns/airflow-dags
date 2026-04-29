@@ -355,6 +355,7 @@ def extract_relations(**ctx) -> None:
 
 
 # Task 5 : report_stats
+# TODO: _s3_read_parquet 제거 xcom_pull -> TaskFlow API 활용방안
 def report_stats(**ctx) -> None:
     ti = ctx["ti"]
     total_lines = ti.xcom_pull(task_ids="validate_input", key="total_lines")
@@ -435,7 +436,10 @@ with DAG(
         task_id="extract_entities", python_callable=extract_entities
     )
     t_relations = PythonOperator(
-        task_id="extract_relations", python_callable=extract_relations
+        task_id="extract_relations",
+        python_callable=extract_relations,
+        # outlets=[GOLD_SESSION_ASSET, GOLD_ENTITY_ASSET, GOLD_RELATION_ASSET],
+        # TODO:report_stats 대신 골드 데이터 생성후 neo4j 적재 트리거
     )
     t_report = PythonOperator(
         task_id="report_stats",
