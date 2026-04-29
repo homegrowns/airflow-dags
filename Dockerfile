@@ -13,5 +13,5 @@ COPY requirements.txt /opt/airflow/requirements.txt
 
 RUN pip install --no-cache-dir \
     apache-airflow-providers-amazon \
-    -r /opt/airflow/requirements.txt \
-    -c "https://raw.githubusercontent.com/apache/airflow/constraints-3.1.6/constraints-3.12.txt"
+    -c "https://raw.githubusercontent.com/apache/airflow/constraints-3.1.6/constraints-3.12.txt" \
+     && pip install --no-cache-dir -r /opt/airflow/requirements.txt
