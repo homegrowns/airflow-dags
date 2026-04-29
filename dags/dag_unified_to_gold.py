@@ -9,7 +9,7 @@ S3 silver/common_records (Spark 파티션 parquet) → session_gold / entity_gol
     · 예) minute_10=10 처리 중 → minute_10=20 폴더 감지되면 통과
   - _silver_sensor_prefix / _gold_s3_key: KST 변환 적용
   - _ms_to_iso → ms_to_kst_iso (KST 변환)
-  - _load_silver_records fallback 제거 (wait_for_silver 통과 후 없으면 에러)
+  - load_silver_records fallback 제거 (wait_for_silver 통과 후 없으면 에러)
   - TriggerDagRunOperator: neo4j_to_rag 트리거 (session_key conf 전달)
 
 Pipeline:
@@ -30,14 +30,11 @@ Author : Linda
 
 from __future__ import annotations
 
-import hashlib
 import io
 import json
 import logging
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from airflow import DAG
@@ -47,28 +44,25 @@ from airflow.sdk import Asset
 from airflow.sensors.python import PythonSensor
 
 from src.common.common_helper import (
-    ms_to_kst_iso,
     s3_client,
-    to_kst,
 )
 from src.security_metadata.aws_config import (
-    AWS_REGION,
-    BATCH_SIZE,
     GOLD_ENTITY_ASSET,
     GOLD_RELATION_ASSET,
     GOLD_SESSION_ASSET,
     S3_BUCKET,
-    S3_GOLD_PREFIX,
-    S3_SILVER_PREFIX,
+)
+from src.unified_to_gold.common_utill import (
+    check_next_partition_exists,
+    is_ip,
+    load_silver_records,
+    make_session_id,
 )
 from src.unified_to_gold.gold_parquet_route import (
     gold_s3_key,
-    next_silver_prefix,
-    silver_sensor_prefix,
 )
 
-# ── S3 설정 ───────────────────────────────────────────────────────────────────
-
+# S3 설정
 KST = ZoneInfo("Asia/Seoul")
 
 GOLD_SESSION_ASSET = Asset(GOLD_SESSION_ASSET)
@@ -78,9 +72,7 @@ GOLD_RELATION_ASSET = Asset(GOLD_RELATION_ASSET)
 logger = logging.getLogger(__name__)
 
 
-# ── parquet 읽기/쓰기 ─────────────────────────────────────────────────────────
-
-
+# parquet 읽기/쓰기
 def _s3_write_parquet(s3_key: str, records: list[dict]) -> None:
     import pandas as pd
 
@@ -120,215 +112,9 @@ def _s3_read_parquet(s3_key: str) -> list[dict]:
     return df.where(df.notna(), None).to_dict(orient="records")
 
 
-# ── silver prefix 헬퍼 ────────────────────────────────────────────────────────
-
-
-def _list_silver_parquet_keys(prefix: str) -> list[str]:
-    s3 = s3_client()
-    paginator = s3.get_paginator("list_objects_v2")
-    keys: list[str] = []
-    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith(".parquet") and "_SUCCESS" not in key:
-                keys.append(key)
-    return keys
-
-
-# ── silver parquet 로딩 공통 헬퍼 ────────────────────────────────────────────
-
-
-def _load_silver_records(ctx) -> list[dict]:
-    """
-    DAG 실행 시각 기준 silver prefix 내 parquet 전체 읽기
-    → community_id 기준 통합 → list[dict] 반환.
-    """
-    import pandas as pd
-
-    # ── 테스트 모드: conf에 test_prefix가 있으면 고정 prefix 사용 ──
-    """
-    test_prefix 예시
-    {
-    "test_prefix": "silver/common_records/dt=2026-04-03/hour=22/minute_10=30/batch_seq=00000/"
-    }
-    """
-    conf = ctx["dag_run"].conf or {}
-    test_prefix = conf.get("test_prefix")
-
-    if test_prefix:
-        prefix = test_prefix
-        logger.info("_load_silver_records: 테스트 모드 — prefix=%s", prefix)
-    else:
-        execution_date: datetime = ctx["logical_date"]
-        prefix = silver_sensor_prefix(execution_date)
-
-    keys = _list_silver_parquet_keys(prefix)
-
-    if not keys:
-        # wait_for_silver 통과 후 여기 오면 안 됨
-        raise ValueError(f"silver parquet 없음 — prefix: {prefix}")
-
-    s3 = s3_client()
-    frames: list = []
-    for key in keys:
-        try:
-            obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
-            frames.append(pd.read_parquet(io.BytesIO(obj["Body"].read())))
-        except Exception as e:
-            logger.warning("parquet 읽기 실패 — %s: %s", key, e)
-
-    if not frames:
-        raise ValueError("읽을 수 있는 silver parquet 파일이 없습니다.")
-
-    df = pd.concat(frames, ignore_index=True)
-    df = df.drop(
-        columns=[c for c in ("dt", "hour", "batch_seq", "minute_10") if c in df.columns]
-    )
-    if "flow_start" in df.columns:
-        df = df.sort_values("flow_start", na_position="last")
-
-    def _convert(v: Any) -> Any:
-        if isinstance(v, float) and v != v:
-            return None
-        if isinstance(v, bool):
-            return v
-        if isinstance(v, (int, str)):
-            return v
-        if hasattr(v, "item"):
-            return v.item()
-        if isinstance(v, list):
-            return v
-        return v
-
-    NUMERIC_FIELDS = (
-        "uid",
-        "flow_id",
-        "src_ip",
-        "src_port",
-        "dest_ip",
-        "dest_port",
-        "proto",
-        "service",
-        "is_threat",
-        "alert_count",
-        "threat_level",
-    )
-
-    merged: dict[str, dict] = {}
-    orphan_idx = 0
-
-    for _, row in df.iterrows():
-        record: dict[str, Any] = {k: _convert(v) for k, v in row.to_dict().items()}
-        record["flow_start"] = ms_to_kst_iso(record.get("flow_start"))
-        record["flow_end"] = ms_to_kst_iso(record.get("flow_end"))
-
-        tl_raw = record.get("timeline", [])
-        if isinstance(tl_raw, str):
-            try:
-                tl_parsed = json.loads(tl_raw)
-                if not isinstance(tl_parsed, list):
-                    tl_parsed = []
-            except json.JSONDecodeError:
-                tl_parsed = []
-        elif isinstance(tl_raw, list):
-            tl_parsed = tl_raw
-        else:
-            tl_parsed = []
-        record["timeline"] = tl_parsed
-
-        cid = record.get("community_id")
-        if not cid:
-            merged[f"_orphan_{orphan_idx}"] = record
-            orphan_idx += 1
-            continue
-
-        if cid not in merged:
-            merged[cid] = record
-        else:
-            ex = merged[cid]
-            ex["timeline"] = ex.get("timeline", []) + tl_parsed
-            for f in NUMERIC_FIELDS:
-                if record.get(f) is not None:
-                    ex[f] = record[f]
-            fs_old, fs_new = ex.get("flow_start"), record.get("flow_start")
-            if fs_old and fs_new:
-                ex["flow_start"] = min(fs_old, fs_new)
-            elif fs_new:
-                ex["flow_start"] = fs_new
-            fe_old, fe_new = ex.get("flow_end"), record.get("flow_end")
-            if fe_old and fe_new:
-                ex["flow_end"] = max(fe_old, fe_new)
-            elif fe_new:
-                ex["flow_end"] = fe_new
-
-    records = list(merged.values())
-    logger.info(
-        "_load_silver_records 완료 — community_id 기준 %d 레코드 (prefix: %s)",
-        len(records),
-        prefix,
-    )
-    return records
-
-
-# ── 공통 유틸 ─────────────────────────────────────────────────────────────────
-
-
-def _make_session_id(community_id: str | None, idx: int) -> str:
-    if community_id:
-        return f"s_{hashlib.sha1(community_id.encode()).hexdigest()[:8]}"
-    return f"s_orphan_{idx:04d}"
-
-
-def _is_ip(value: str) -> bool:
-    parts = value.split(".")
-    return len(parts) == 4 and all(p.isdigit() for p in parts)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Sensor : wait_for_silver
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def _check_next_partition_exists(**ctx) -> bool:
-    """
-    다음 minute_10 폴더가 S3에 존재하면 True → 현재 배치 완성으로 판단.
-    예) 현재=minute_10=10 → minute_10=20 폴더에 파일 있으면 통과.
-    """
-    # ── 테스트 모드: conf에 test_prefix가 있으면 즉시 통과 ──
-    conf = ctx["dag_run"].conf or {}
-    if conf.get("test_prefix"):
-        logger.info("wait_for_silver: test_prefix 감지 → 즉시 통과 (테스트 모드)")
-        return True
-
-    execution_date: datetime = ctx["logical_date"]
-    next_prefix = next_silver_prefix(execution_date)
-    keys = _list_silver_parquet_keys(next_prefix)
-
-    if keys:
-        logger.info(
-            "wait_for_silver: 다음 파티션 감지 → 현재 배치 완성 판단\n"
-            "  next_prefix: %s (%d개)",
-            next_prefix,
-            len(keys),
-        )
-        return True
-
-    current_prefix = silver_sensor_prefix(execution_date)
-    logger.info(
-        "wait_for_silver: 대기 중\n  current: %s\n  waiting: %s",
-        current_prefix,
-        next_prefix,
-    )
-    return False
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # Task 1 : validate_input
-# ══════════════════════════════════════════════════════════════════════════════
-
-
 def validate_input(**ctx) -> None:
-    records = _load_silver_records(ctx)
+    records = load_silver_records(ctx)
     record_count = len(records)
     if record_count == 0:
         raise ValueError("silver parquet 에서 읽은 레코드가 없습니다.")
@@ -336,187 +122,17 @@ def validate_input(**ctx) -> None:
     ctx["ti"].xcom_push(key="total_lines", value=record_count)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Task 2 : extract_sessions
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def _extract_conn(row: dict, timeline: list[dict]) -> dict:
-    base = {
-        "uid": row.get("uid"),
-        "ts": row.get("flow_start"),
-        "src_ip": row.get("src_ip"),
-        "src_port": row.get("src_port"),
-        "dest_ip": row.get("dest_ip"),
-        "dest_port": row.get("dest_port"),
-        "proto": row.get("proto"),
-        "service": row.get("service"),
-        "duration": None,
-        "orig_bytes": None,
-        "resp_bytes": None,
-        "conn_state": None,
-        "missed_bytes": None,
-        "history": None,
-        "orig_pkts": None,
-        "resp_pkts": None,
-    }
-    for ev in timeline:
-        if ev.get("source") != "zeek_conn":
-            continue
-        if not base["uid"]:
-            base["uid"] = ev.get("uid")
-        if not base["src_ip"]:
-            base["src_ip"] = ev.get("orig_h")
-        if not base["dest_ip"]:
-            base["dest_ip"] = ev.get("resp_h")
-        if not base["src_port"]:
-            base["src_port"] = ev.get("orig_p")
-        if not base["dest_port"]:
-            base["dest_port"] = ev.get("resp_p")
-        base["duration"] = ev.get("duration")
-        base["orig_bytes"] = ev.get("orig_bytes")
-        base["resp_bytes"] = ev.get("resp_bytes")
-        base["conn_state"] = ev.get("conn_state")
-        base["missed_bytes"] = ev.get("missed_bytes")
-        base["history"] = ev.get("history")
-        base["orig_pkts"] = ev.get("orig_pkts")
-        base["resp_pkts"] = ev.get("resp_pkts")
-        break
-    if not base["src_ip"] or not base["dest_ip"]:
-        for ev in timeline:
-            if ev.get("source") != "suricata":
-                continue
-            if not base["src_ip"]:
-                base["src_ip"] = ev.get("src_ip")
-            if not base["dest_ip"]:
-                base["dest_ip"] = ev.get("dest_ip")
-            if not base["src_port"]:
-                base["src_port"] = ev.get("src_port")
-            if not base["dest_port"]:
-                base["dest_port"] = ev.get("dest_port")
-            if not base["proto"] and ev.get("proto"):
-                base["proto"] = ev["proto"].lower()
-            break
-    return base
-
-
-def _extract_http(timeline: list[dict]) -> dict:
-    _null = {
-        k: None
-        for k in [
-            "http_method",
-            "http_host",
-            "http_uri",
-            "http_user_agent",
-            "http_request_body_len",
-            "http_response_body_len",
-            "http_status_code",
-            "http_status_msg",
-            "http_version",
-        ]
-    }
-    for ev in timeline:
-        if ev.get("source") != "zeek_http":
-            continue
-        host = ev.get("host")
-        if host and ":" in host:
-            host = host.rsplit(":", 1)[0]
-        return {
-            "http_method": ev.get("method"),
-            "http_host": host,
-            "http_uri": ev.get("uri"),
-            "http_user_agent": ev.get("user_agent"),
-            "http_request_body_len": ev.get("request_body_len"),
-            "http_response_body_len": ev.get("response_body_len"),
-            "http_status_code": ev.get("status_code"),
-            "http_status_msg": ev.get("status_msg"),
-            "http_version": ev.get("version"),
-        }
-    return _null
-
-
-def _extract_dns(timeline: list[dict]) -> dict:
-    _null = {
-        k: None
-        for k in [
-            "dns_query",
-            "dns_qtype_name",
-            "dns_rcode_name",
-            "dns_answers",
-            "dns_rtt",
-        ]
-    }
-    for ev in timeline:
-        if ev.get("source") == "zeek_dns":
-            return {
-                "dns_query": ev.get("query"),
-                "dns_qtype_name": ev.get("qtype_name"),
-                "dns_rcode_name": ev.get("rcode_name"),
-                "dns_answers": ev.get("answers"),
-                "dns_rtt": ev.get("rtt"),
-            }
-    return _null
-
-
-def _extract_ssl(timeline: list[dict]) -> dict:
-    _null = {
-        k: None
-        for k in [
-            "tls_version",
-            "tls_cipher",
-            "tls_curve",
-            "tls_sni",
-            "tls_ssl_history",
-            "tls_established",
-            "tls_resumed",
-        ]
-    }
-    for ev in timeline:
-        if ev.get("source") == "zeek_ssl":
-            return {
-                "tls_version": ev.get("version"),
-                "tls_cipher": ev.get("cipher"),
-                "tls_curve": ev.get("curve"),
-                "tls_sni": ev.get("server_name"),
-                "tls_ssl_history": ev.get("ssl_history"),
-                "tls_established": ev.get("established"),
-                "tls_resumed": ev.get("resumed"),
-            }
-    return _null
-
-
-def _extract_suricata_stats(row: dict, timeline: list[dict]) -> dict:
-    alert_count = row.get("alert_count") or 0
-    max_severity = row.get("threat_level")
-    flow_ev: dict = {}
-    for ev in timeline:
-        if ev.get("source") == "suricata" and ev.get("event_type") == "flow":
-            flow_ev = ev
-            break
-    if max_severity is None:
-        severities = [
-            int(ev["severity"])
-            for ev in timeline
-            if ev.get("source") == "suricata"
-            and ev.get("event_type") == "alert"
-            and ev.get("severity") is not None
-        ]
-        max_severity = min(severities) if severities else None
-    return {
-        "alert_count": alert_count,
-        "max_severity": max_severity,
-        "flow_state": flow_ev.get("flow_state"),
-        "flow_reason": flow_ev.get("flow_reason"),
-        "pkts_toserver": flow_ev.get("pkts_toserver"),
-        "pkts_toclient": flow_ev.get("pkts_toclient"),
-        "bytes_toserver": flow_ev.get("bytes_toserver"),
-        "bytes_toclient": flow_ev.get("bytes_toclient"),
-    }
-
-
 def extract_sessions(**ctx) -> None:
+    from src.unified_to_gold.extract_sessions import (
+        extract_conn,
+        extract_dns,
+        extract_http,
+        extract_ssl,
+        extract_suricata_stats,
+    )
+
     execution_date: datetime = ctx["logical_date"]
-    raw_sessions = _load_silver_records(ctx)
+    raw_sessions = load_silver_records(ctx)
 
     seen_cids: dict[str, str] = {}
     orphan_idx = 0
@@ -527,18 +143,18 @@ def extract_sessions(**ctx) -> None:
         if cid and cid in seen_cids:
             session_id = seen_cids[cid]
         elif cid:
-            session_id = _make_session_id(cid, 0)
+            session_id = make_session_id(cid, 0)
             seen_cids[cid] = session_id
         else:
-            session_id = _make_session_id(None, orphan_idx)
+            session_id = make_session_id(None, orphan_idx)
             orphan_idx += 1
 
         timeline = session.get("timeline", [])
-        conn = _extract_conn(session, timeline)
-        http = _extract_http(timeline)
-        dns = _extract_dns(timeline)
-        ssl = _extract_ssl(timeline)
-        suri = _extract_suricata_stats(session, timeline)
+        conn = extract_conn(session, timeline)
+        http = extract_http(timeline)
+        dns = extract_dns(timeline)
+        ssl = extract_ssl(timeline)
+        suri = extract_suricata_stats(session, timeline)
 
         records.append(
             {
@@ -585,206 +201,32 @@ def extract_sessions(**ctx) -> None:
     ctx["ti"].xcom_push(key="session_count", value=len(records))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Task 3 : extract_entities
-# TODO 데이터 전처리 panda or Polars 고려
-# ══════════════════════════════════════════════════════════════════════════════
-
-
+# TODO 데이터 전처리  Polars 고려
 def extract_entities(**ctx) -> None:
+    from src.unified_to_gold.extract_entities import extract_entities
+
     execution_date: datetime = ctx["logical_date"]
     session_key = ctx["ti"].xcom_pull(task_ids="extract_sessions", key="session_key")
-    sessions = _s3_read_parquet(session_key)
-    raw = _load_silver_records(ctx)
+    sessions_df = _s3_read_parquet(session_key)
+    raw_df = load_silver_records(ctx)
 
-    ip_bucket: dict[str, dict] = {}
-    domain_bucket: dict[str, dict] = {}
-    alert_bucket: dict[str, dict] = {}
-
-    def _update_ip(ip, ts, sid, orig=0, resp=0):
-        if not ip:
-            return
-        b = ip_bucket.setdefault(
-            ip,
-            {
-                "first_seen": ts,
-                "last_seen": ts,
-                "sessions": set(),
-                "orig_bytes": 0,
-                "resp_bytes": 0,
-            },
-        )
-        if ts:
-            if not b["first_seen"] or ts < b["first_seen"]:
-                b["first_seen"] = ts
-            if not b["last_seen"] or ts > b["last_seen"]:
-                b["last_seen"] = ts
-        b["sessions"].add(sid)
-        b["orig_bytes"] += orig
-        b["resp_bytes"] += resp
-
-    def _update_domain(domain, ts, sid):
-        if not domain:
-            return
-        b = domain_bucket.setdefault(
-            domain,
-            {
-                "first_seen": ts,
-                "last_seen": ts,
-                "sessions": set(),
-            },
-        )
-        if ts:
-            if not b["first_seen"] or ts < b["first_seen"]:
-                b["first_seen"] = ts
-            if not b["last_seen"] or ts > b["last_seen"]:
-                b["last_seen"] = ts
-        b["sessions"].add(sid)
-
-    def _update_alert(sig_id, sig, category, severity, ts, sid):
-        if not sig_id and not sig:
-            return
-        key = str(sig_id or sig)
-        b = alert_bucket.setdefault(
-            key,
-            {
-                "first_seen": ts,
-                "last_seen": ts,
-                "sessions": set(),
-                "signature": sig,
-                "signature_id": sig_id,
-                "category": category,
-            },
-        )
-        if ts:
-            if not b["first_seen"] or ts < b["first_seen"]:
-                b["first_seen"] = ts
-            if not b["last_seen"] or ts > b["last_seen"]:
-                b["last_seen"] = ts
-        b["sessions"].add(sid)
-
-    for sess in sessions:
-        sid = sess["session_id"]
-        ts = sess.get("flow_start")
-        _update_ip(sess.get("src_ip"), ts, sid)
-        _update_ip(sess.get("dest_ip"), ts, sid)
-        http_host = sess.get("http_host")
-        if http_host:
-            (_update_ip if _is_ip(http_host) else _update_domain)(http_host, ts, sid)
-        if sess.get("tls_sni"):
-            _update_domain(sess["tls_sni"], ts, sid)
-        if sess.get("dns_query"):
-            _update_domain(sess["dns_query"], ts, sid)
-
-    cid_to_sid = {
-        s["community_id"]: s["session_id"] for s in sessions if s.get("community_id")
-    }
-
-    for raw_sess in raw:
-        sid = cid_to_sid.get(raw_sess.get("community_id"), "unknown")
-        for ev in raw_sess.get("timeline", []):
-            source = ev.get("source", "")
-            ts = ev.get("ts")
-            if source == "zeek_conn":
-                _update_ip(ev.get("orig_h"), ts, sid, int(ev.get("orig_bytes") or 0), 0)
-                _update_ip(ev.get("resp_h"), ts, sid, 0, int(ev.get("resp_bytes") or 0))
-            elif source == "suricata":
-                _update_ip(ev.get("src_ip"), ts, sid)
-                _update_ip(ev.get("dest_ip"), ts, sid)
-                if ev.get("event_type") == "alert" and ev.get("signature"):
-                    _update_alert(
-                        ev.get("signature_id"),
-                        ev.get("signature"),
-                        ev.get("category"),
-                        ev.get("severity"),
-                        ts,
-                        sid,
-                    )
-            elif source == "zeek_dns":
-                _update_domain(ev.get("query"), ts, sid)
-                answers_raw = ev.get("answers")
-                if answers_raw:
-                    for ans in str(answers_raw).split(","):
-                        ans = ans.strip()
-                        if not ans:
-                            continue
-                        parts = ans.split(".")
-                        (
-                            _update_ip
-                            if (len(parts) == 4 and all(p.isdigit() for p in parts))
-                            else _update_domain
-                        )(ans, ts, sid)
-            elif source == "zeek_ssl":
-                if ev.get("server_name"):
-                    _update_domain(ev["server_name"], ts, sid)
-
-    records: list[dict] = []
-    for ip, b in ip_bucket.items():
-        records.append(
-            {
-                "entity_type": "ip",
-                "entity_value": ip,
-                "first_seen": b["first_seen"],
-                "last_seen": b["last_seen"],
-                "related_session_count": len(b["sessions"]),
-                "total_orig_bytes": b["orig_bytes"],
-                "total_resp_bytes": b["resp_bytes"],
-                "signature": None,
-                "category": None,
-            }
-        )
-    for domain, b in domain_bucket.items():
-        records.append(
-            {
-                "entity_type": "domain",
-                "entity_value": domain,
-                "first_seen": b["first_seen"],
-                "last_seen": b["last_seen"],
-                "related_session_count": len(b["sessions"]),
-                "total_orig_bytes": None,
-                "total_resp_bytes": None,
-                "signature": None,
-                "category": None,
-            }
-        )
-    for key, b in alert_bucket.items():
-        records.append(
-            {
-                "entity_type": "alert",
-                "entity_value": key,
-                "first_seen": b["first_seen"],
-                "last_seen": b["last_seen"],
-                "related_session_count": len(b["sessions"]),
-                "total_orig_bytes": None,
-                "total_resp_bytes": None,
-                "signature": b["signature"],
-                "category": b["category"],
-            }
-        )
+    records = extract_entities(sessions_df=sessions_df, raw_df=raw_df)
 
     entity_key = gold_s3_key("entity_gold", execution_date)
+
     _s3_write_parquet(entity_key, records)
-    logger.info(
-        "extract_entities 완료 — ip:%d domain:%d alert:%d → %s",
-        len(ip_bucket),
-        len(domain_bucket),
-        len(alert_bucket),
-        entity_key,
-    )
+
     ctx["ti"].xcom_push(key="entity_key", value=entity_key)
     ctx["ti"].xcom_push(key="entity_count", value=len(records))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Task 4 : extract_relations
-# ══════════════════════════════════════════════════════════════════════════════
-
-
 def extract_relations(**ctx) -> None:
     execution_date: datetime = ctx["logical_date"]
     session_key = ctx["ti"].xcom_pull(task_ids="extract_sessions", key="session_key")
     sessions = _s3_read_parquet(session_key)
-    raw = _load_silver_records(ctx)
+    raw = load_silver_records(ctx)
     cid_to_sid = {
         s["community_id"]: s["session_id"] for s in sessions if s.get("community_id")
     }
@@ -826,7 +268,7 @@ def extract_relations(**ctx) -> None:
                 "ip",
                 src_ip,
                 "REQUESTED",
-                "ip" if _is_ip(http_host) else "domain",
+                "ip" if is_ip(http_host) else "domain",
                 http_host,
                 sid,
             )
@@ -899,11 +341,7 @@ def extract_relations(**ctx) -> None:
     ctx["ti"].xcom_push(key="relation_count", value=len(records))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Task 5 : report_stats
-# ══════════════════════════════════════════════════════════════════════════════
-
-
 def report_stats(**ctx) -> None:
     ti = ctx["ti"]
     total_lines = ti.xcom_pull(task_ids="validate_input", key="total_lines")
@@ -954,10 +392,7 @@ def report_stats(**ctx) -> None:
     logger.info("=" * 65)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # DAG 정의
-# ══════════════════════════════════════════════════════════════════════════════
-
 default_args = {
     "owner": "linda",
     "depends_on_past": False,
@@ -980,7 +415,7 @@ with DAG(
     # 다음 minute_10 폴더가 생기면 현재 배치 완성으로 판단
     wait_for_silver = PythonSensor(
         task_id="wait_for_silver",
-        python_callable=_check_next_partition_exists,
+        python_callable=check_next_partition_exists,
         poke_interval=60,
         timeout=60 * 60,  # 최대 1시간 대기
         mode="poke",

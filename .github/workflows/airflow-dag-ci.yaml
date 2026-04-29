@@ -2,7 +2,7 @@ name: Airflow DAGs CI
 
 on:
   push:
-    branches: [dev]
+    branches: [test]
     paths:
       - 'dags/**'       # dags 폴더 변경 시에만 실행
       - 'plugins/**'    # plugins 폴더 변경 시에만 실행

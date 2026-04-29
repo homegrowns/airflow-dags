@@ -23,10 +23,7 @@ def s3_client():
     return boto3.client("s3", region_name=AWS_REGION)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # unified_to_gold 공통 헬퍼
-# TODO: 아래 시간 변환 함수 다 같은거 아닌가?
-# ══════════════════════════════════════════════════════════════════════════════
 
 
 def to_kst(dt: datetime) -> datetime:
@@ -60,9 +57,7 @@ def ms_to_kst_iso(ms: Any) -> str | None:
         return str(ms)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # gold_to_neo4j 공통 헬퍼
-# ══════════════════════════════════════════════════════════════════════════════
 
 
 def s3_read_parquet(s3_key: str) -> list[dict]:
@@ -132,9 +127,7 @@ def get_source_run_id(ctx) -> str | None:
     return None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # neo4_to_rag 공통 헬퍼
-# ══════════════════════════════════════════════════════════════════════════════
 
 
 def neo4j_driver():
@@ -167,27 +160,3 @@ def make_session_id(community_id: str | None, idx: int) -> str:
 
 def now_kst_iso() -> str:
     return datetime.now(tz=KST).isoformat()
-
-
-# def ms_to_kst_iso(ms: Any) -> str | None:
-#     if ms is None:
-#         return None
-#     if isinstance(ms, str):
-#         try:
-#             s = ms.replace(" ", "T")
-#             if s.endswith("Z"):
-#                 s = s[:-1] + "+00:00"
-#             dt = datetime.fromisoformat(s)
-#             if dt.tzinfo is None:
-#                 dt = dt.replace(tzinfo=timezone.utc)
-#             return dt.astimezone(KST).isoformat()
-#         except Exception:
-#             return ms
-#     try:
-#         return (
-#             datetime.fromtimestamp(int(ms) / 1000.0, tz=timezone.utc)
-#             .astimezone(KST)
-#             .isoformat()
-#         )
-#     except Exception:
-#         return str(ms)

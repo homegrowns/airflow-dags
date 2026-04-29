@@ -15,6 +15,4 @@ dependencies = [
   # Airflow Amazon provider
   "apache-airflow-providers-amazon",
 
-  # SqsSensor를 deferrable=True 로 쓸 때 필요
-  "aiobotocore",
 ]
