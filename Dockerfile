@@ -1,5 +1,5 @@
-FROM apache/airflow:3.0.2-python3.11
-
+# FROM apache/airflow:3.0.2-python3.11
+FROM apache/airflow:3.2.1-python3.13
 USER airflow
 WORKDIR /opt/airflow
 

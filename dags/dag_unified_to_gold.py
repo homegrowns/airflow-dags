@@ -71,8 +71,6 @@ from src.unified_to_gold.gold_parquet_route import (
 
 # ── S3 설정 ───────────────────────────────────────────────────────────────────
 
-KST = ZoneInfo("Asia/Seoul")
-
 GOLD_SESSION_ASSET = Asset(GOLD_SESSION_ASSET)
 GOLD_ENTITY_ASSET = Asset(GOLD_ENTITY_ASSET)
 GOLD_RELATION_ASSET = Asset(GOLD_RELATION_ASSET)
@@ -144,6 +142,9 @@ def _load_silver_records(ctx) -> list[dict]:
     """
     DAG 실행 시각 기준 silver prefix 내 parquet 전체 읽기
     → community_id 기준 통합 → list[dict] 반환.
+
+    TODO : load_silver_records 테스크화
+    이유 : 원본 여러 파일 + 병합 연산을 태스크마다 반복하는 구조 개선
     """
     import pandas as pd
 
@@ -951,11 +952,11 @@ with DAG(
     dag_id="unified_events_to_gold",
     description="Spark silver parquet → session/entity/relation gold 전처리 (v9)",
     default_args=default_args,
-    start_date=datetime(2026, 1, 1),
+    start_date=datetime(2026, 4, 14),
     schedule="*/10 * * * *",
     catchup=False,
     max_active_runs=4,  # 배치 동시 처리
-    max_active_tasks=6,
+    max_active_tasks=5,
     tags=["cti", "graph-rag", "preprocessing"],
 ) as dag:
 
