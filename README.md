@@ -11,7 +11,7 @@ repo-root/
 │   ├── dag_gold_to_neo4j.py
 │   └── dag_neo4j_to_rag.py
 ├── plugins/                
-└── src/                    helm value.yaml에서 subPath 추가 필요  
+└── src/        helm value.yaml에서 extraEnv 항목 - name: PYTHONPATH 필요  value: /opt/airflow/dags/repo 추가 
     ├── __init__.py
     ├── security_metadata/
     │   ├── __init__.py
