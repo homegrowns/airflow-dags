@@ -11,7 +11,7 @@ repo-root/
 │   ├── dag_gold_to_neo4j.py
 │   └── dag_neo4j_to_rag.py
 ├── plugins/                
-└── src/        helm value.yaml에서 extraEnv 항목 - name: PYTHONPATH 필요  value: /opt/airflow/dags/repo 추가 
+└── src/ 
     ├── __init__.py
     ├── security_metadata/
     │   ├── __init__.py
@@ -33,6 +33,7 @@ repo-root/
         ├── __init__.py
         └── gold_parquet_route.py
 
+helm values.yaml에서 extraEnv 항목 - name: PYTHONPATH 필요  value: /opt/airflow/dags/repo 추가
 ```
 
 | DAG | 스케줄 | 역할 |
