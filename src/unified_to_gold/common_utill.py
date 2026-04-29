@@ -164,7 +164,7 @@ def load_silver_records(ctx) -> list[dict]:
     return records
 
 
-# ── 공통 유틸 ─────────────────────────────────────────────────────────────────
+# 공통 유틸
 
 
 def make_session_id(community_id: str | None, idx: int) -> str:

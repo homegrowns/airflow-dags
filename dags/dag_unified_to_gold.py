@@ -71,6 +71,18 @@ GOLD_RELATION_ASSET = Asset(GOLD_RELATION_ASSET)
 
 logger = logging.getLogger(__name__)
 
+# DAG 정의
+default_args = {
+    "owner": "linda",
+    "depends_on_past": False,
+    "retries": 3,
+    "retry_delay": timedelta(minutes=3),
+    "email_on_failure": False,
+}
+
+max_active_runs = 4
+max_active_tasks = 10
+
 
 # parquet 읽기/쓰기
 def _s3_write_parquet(s3_key: str, records: list[dict]) -> None:
@@ -122,6 +134,7 @@ def validate_input(**ctx) -> None:
     ctx["ti"].xcom_push(key="total_lines", value=record_count)
 
 
+# Task 2 : extract_sessions
 def extract_sessions(**ctx) -> None:
     from src.unified_to_gold.extract_sessions import (
         extract_conn,
@@ -392,15 +405,6 @@ def report_stats(**ctx) -> None:
     logger.info("=" * 65)
 
 
-# DAG 정의
-default_args = {
-    "owner": "linda",
-    "depends_on_past": False,
-    "retries": 3,
-    "retry_delay": timedelta(minutes=3),
-    "email_on_failure": False,
-}
-
 with DAG(
     dag_id="unified_events_to_gold",
     description="Spark silver parquet → session/entity/relation gold 전처리 (v9)",
@@ -408,8 +412,8 @@ with DAG(
     start_date=datetime(2026, 4, 14),
     schedule="*/10 * * * *",
     catchup=False,
-    max_active_runs=4,  # 배치 동시 처리
-    max_active_tasks=10,
+    max_active_runs=max_active_runs,  # 배치 동시 처리
+    max_active_tasks=max_active_tasks,
     tags=["cti", "graph-rag", "preprocessing"],
 ) as dag:
     # 다음 minute_10 폴더가 생기면 현재 배치 완성으로 판단
