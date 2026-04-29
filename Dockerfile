@@ -1,17 +1,14 @@
-# FROM apache/airflow:3.0.2-python3.11
 FROM apache/airflow:3.1.6-python3.12
-
-USER airflow
-WORKDIR /opt/airflow
 
 COPY requirements.txt /opt/airflow/requirements.txt
 
-# RUN pip install --no-cache-dir \
-#     "apache-airflow-providers-amazon==9.8.0" \
-#     -c "https://raw.githubusercontent.com/apache/airflow/constraints-3.2.1/constraints-3.13.txt" \
-#  && pip install --no-cache-dir -r /opt/airflow/requirements.txt
-
+# 1단계: Airflow provider는 constraints로 설치
 RUN pip install --no-cache-dir \
-    apache-airflow-providers-amazon \
-    -c "https://raw.githubusercontent.com/apache/airflow/constraints-3.1.6/constraints-3.12.txt" \
-     && pip install --no-cache-dir -r /opt/airflow/requirements.txt
+    "apache-airflow==3.1.6" \
+    "apache-airflow-providers-amazon" \
+    -c "https://raw.githubusercontent.com/apache/airflow/constraints-3.1.6/constraints-3.12.txt"
+
+# 2단계: 내 requirements는 constraints 없이 설치
+RUN pip install --no-cache-dir \
+    "apache-airflow==3.1.6" \
+    -r /opt/airflow/requirements.txt
