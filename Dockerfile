@@ -1,5 +1,6 @@
 # FROM apache/airflow:3.0.2-python3.11
-FROM apache/airflow:3.2.1-python3.13
+FROM apache/airflow:3.1.6-python3.12
+
 USER airflow
 WORKDIR /opt/airflow
 
@@ -13,4 +14,4 @@ COPY requirements.txt /opt/airflow/requirements.txt
 RUN pip install --no-cache-dir \
     apache-airflow-providers-amazon \
     -r /opt/airflow/requirements.txt \
-    -c "https://raw.githubusercontent.com/apache/airflow/constraints-3.2.1/constraints-3.13.txt"
+    -c "https://raw.githubusercontent.com/apache/airflow/constraints-3.1.6/constraints-3.12.txt"

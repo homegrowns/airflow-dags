@@ -4,7 +4,8 @@
 # pyarrow>=23.0.1
 # neo4j>=5,<7
 # groq>=1.0.0
-# apache/airflow:3.2.1-python3.13
+
+# ==========apache/airflow:3.1.6-python3.12========
 confluent-kafka>=2.13.0
 pandas>=2.2,<3
 pyarrow
