@@ -1,5 +1,7 @@
 from typing import Final
 
+# load_sessions
+
 SESSION_QUERY: Final[str] = """
 UNWIND $rows AS r
 MERGE (s:Session {session_id: r.session_id})
@@ -55,9 +57,7 @@ SET
 """
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Task 3 : load_entities
-# ══════════════════════════════════════════════════════════════════════════════
+# load_entities
 
 IP_QUERY: Final[str] = """
 UNWIND $rows AS r
@@ -81,9 +81,7 @@ SET n.first_seen=r.first_seen, n.last_seen=r.last_seen,
 """
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Task 4 : load_relations
-# ══════════════════════════════════════════════════════════════════════════════
+# load_relations
 
 SESSION_CONN_QUERY: Final[str] = """
 UNWIND $rows AS r
@@ -107,9 +105,8 @@ RELATION_QUERIES: Final[dict[str, str]] = {
     "ENCRYPTED_WITH": "UNWIND $rows AS r MATCH (src:Session {session_id:r.src_value}) MERGE (dst:Cipher {value:r.dst_value}) MERGE (src)-[:ENCRYPTED_WITH {session_id:r.session_id}]->(dst)",
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Task 5 : create_indexes
-# ══════════════════════════════════════════════════════════════════════════════
+
+# create_indexes
 
 CONSTRAINTS: Final[list[str]] = [
     "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Session) REQUIRE n.session_id IS UNIQUE",
