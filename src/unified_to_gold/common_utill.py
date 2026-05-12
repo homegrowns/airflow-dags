@@ -5,6 +5,8 @@ import logging
 from datetime import datetime
 from typing import Any
 
+import pandas as pd
+
 from src.common.common_helper import (
     ms_to_kst_iso,
     s3_client,
@@ -35,12 +37,6 @@ def load_silver_records(ctx) -> list[dict]:
     → community_id 기준 통합
     → list[dict] 반환
     """
-    import io
-    import json
-    from datetime import datetime
-    from typing import Any
-
-    import pandas as pd
 
     conf = ctx["dag_run"].conf or {}
     test_prefix = conf.get("test_prefix")
@@ -99,6 +95,7 @@ def load_silver_records(ctx) -> list[dict]:
             return v
         return []
 
+    # community_id 기준으로 여러 row를 하나의 record로 병합하기 위한 pandas groupby 준비 로직
     def flatten_timelines(series: pd.Series) -> list:
         result = []
         for item in series:
@@ -120,6 +117,17 @@ def load_silver_records(ctx) -> list[dict]:
 
     # community_id 없는 row는 서로 병합되지 않도록 고유 key 부여
     df["_merge_key"] = df["community_id"]
+
+    # community_id가 없는 row들은 서로 병합하면 안됨
+
+    # 그래서 각각 고유한 key를 부여
+
+    # 예:
+
+    # community_id	_merge_key
+    # None	        _orphan_0
+    # None	        _orphan_1
+    # ""	        _orphan_2
 
     missing_cid_mask = df["_merge_key"].isna() | (df["_merge_key"] == "")
     df.loc[missing_cid_mask, "_merge_key"] = [
